@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: node scripts/check-manifest.mjs
+
+      # Optional real-PI check. `npm test` stays offline; this step names one
+      # cheap model explicitly through PI_SMOKE_PROVIDER / PI_SMOKE_MODEL and
+      # only runs where those secrets are configured.
+      - name: PI smoke (optional)
+        if: ${{ env.PI_SMOKE == '1' }}
+        env:
+          PI_SMOKE: ${{ vars.PI_SMOKE }}
+          PI_SMOKE_PROVIDER: ${{ vars.PI_SMOKE_PROVIDER }}
+          PI_SMOKE_MODEL: ${{ vars.PI_SMOKE_MODEL }}
+        run: ./scripts/pi-smoke.sh
