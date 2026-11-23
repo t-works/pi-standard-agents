@@ -13,6 +13,7 @@ import type {
 	ProviderRequest,
 	ProviderResponse,
 	ProviderToolCallPart,
+	ProviderUsage,
 } from "@standardagents/spec";
 
 /** One canned model answer. `toolCalls` is what makes the runtime take a tool step. */
@@ -20,6 +21,12 @@ export interface ScriptedReply {
 	content?: string | null;
 	reasoning?: string | null;
 	toolCalls?: ProviderToolCallPart[];
+	/**
+	 * Usage this answer reports. Omit for zero tokens; pass `null` to model a
+	 * provider that reports no usage at all — the case the journal must record as
+	 * unknown rather than as free.
+	 */
+	usage?: ProviderUsage | null;
 }
 
 /** A provider factory plus the request log and call counter behind it. */
@@ -35,6 +42,8 @@ const CONFIG_SLOTS: ProviderConfigSlots = {
 	// rather than asking every test to set an environment variable.
 	apiKey: { type: "text", default: "scripted-provider" },
 };
+
+const ZERO_USAGE: ProviderUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
 /**
  * Build a scripted provider.
@@ -58,13 +67,16 @@ export function scriptedProvider(
 			const reply = script[calls] ?? script[script.length - 1] ?? {};
 			calls += 1;
 			const toolCalls = reply.toolCalls ?? [];
+			const usage = reply.usage === undefined ? ZERO_USAGE : reply.usage;
 			return {
 				content: reply.content ?? null,
 				reasoning: reply.reasoning ?? null,
 				...(toolCalls.length ? { toolCalls } : {}),
 				finishReason: toolCalls.length ? "tool_calls" : "stop",
-				usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-			};
+				// `usage` is required by the type, so an omitted one is a deliberate
+				// cast: it reproduces a provider that reports nothing.
+				...(usage ? { usage } : {}),
+			} as ProviderResponse;
 		},
 		async stream(): Promise<AsyncIterable<never>> {
 			throw new Error("scripted provider stream() is not used by the runtime");

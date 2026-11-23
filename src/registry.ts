@@ -118,12 +118,26 @@ export interface WorkflowSpec {
 	tools?: readonly ToolSpec[];
 }
 
+/**
+ * Wraps a resolved provider factory before the registry hands it to a runtime.
+ *
+ * The host uses this to decorate every model in one place — `withUsage(factory,
+ * journal.modelCallSink())` — so the agent's own turns and the nested prompt
+ * tools' hidden ones are measured by the same object.
+ */
+export type ProviderDecorator = (factory: ProviderFactory, model: ModelSpec) => ProviderFactory;
+
 export interface BuildRegistryOptions {
 	/**
 	 * Provider factories for models declared without one, keyed by model name.
 	 * Lets a JSON spec stay pure data while the host decides which provider runs.
 	 */
 	providers?: Readonly<Record<string, ProviderFactory>>;
+	/**
+	 * Applied to every model that ends up with a provider, declared or supplied.
+	 * Runs once per model, before a runtime can cache a provider for it.
+	 */
+	decorate?: ProviderDecorator;
 	/**
 	 * When true (the default) any error-severity issue throws `RegistryBuildError`
 	 * instead of returning a registry the runtime would only fail on later.
@@ -254,7 +268,10 @@ function buildPrompt(spec: PromptSpec): PromptDefinition {
 }
 
 function buildModel(spec: ModelSpec, options: BuildRegistryOptions): ModelDefinition {
-	const provider = spec.provider ?? options.providers?.[spec.name];
+	const declared = spec.provider ?? options.providers?.[spec.name];
+	// Decoration happens here, once per model, so no runtime ever caches an
+	// undecorated provider: `Runtime.providerFor` keeps the first instance it builds.
+	const provider = declared ? (options.decorate?.(declared, spec) ?? declared) : undefined;
 	// No provider means `validateRegistry` reports it; the cast keeps the partial
 	// definition printable in that error instead of throwing here.
 	return { name: spec.name, model: spec.model, provider } as ModelDefinition;
