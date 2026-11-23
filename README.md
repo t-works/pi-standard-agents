@@ -50,6 +50,11 @@ node scripts/check-manifest.mjs    # manifest + dist gate
 npm pack --dry-run --json          # what gets published
 ```
 
+`node --test` runs the `.ts` sources directly, while tsc emits `dist/`, so
+relative imports inside `src/` carry the real `.ts` extension;
+`allowImportingTsExtensions` + `rewriteRelativeImportExtensions` in
+`tsconfig.json` turn them back into `.js` on emit.
+
 `npm test` never reaches a model. The optional real-PI check is gated behind
 `PI_SMOKE=1` plus `PI_SMOKE_PROVIDER` / `PI_SMOKE_MODEL`, so CI names one cheap
 model explicitly instead of relying on ambient credentials.

@@ -8,6 +8,8 @@
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { shutdownRunService } from "./runs.ts";
+
 /** Name of the single tool this unit registers. */
 export const PING_TOOL_NAME = "std_smoke";
 
@@ -34,11 +36,14 @@ export default function standardAgentsExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// Lifecycle wiring is proven here; U04 puts the runtime behind it.
+	// Lifecycle wiring is proven here; the run service (U04) is what these hooks
+	// will drive. Nothing runs at factory time: `shutdownRunService()` releases a
+	// claim only if a session actually took one, so a reload never leaves an
+	// orphan owner.lock behind.
 	pi.on("session_start", () => {
 		// no runtime yet
 	});
 	pi.on("session_shutdown", () => {
-		// no runtime yet
+		shutdownRunService();
 	});
 }
