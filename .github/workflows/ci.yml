@@ -19,18 +19,66 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      # The lockfile is what keeps a runtime range from drifting between
+      # installs, so CI installs from it and nowhere else.
       - run: npm ci
       - run: npm run build
       - run: npm test
       - run: node scripts/check-manifest.mjs
 
+      # The published artifact, not the checkout: pack, install the tarball into
+      # a clean temp dir with a pinned PI host, load it there.
+      - run: node scripts/install-from-tarball.mjs
+
       # Optional real-PI check. `npm test` stays offline; this step names one
       # cheap model explicitly through PI_SMOKE_PROVIDER / PI_SMOKE_MODEL and
-      # only runs where those secrets are configured.
+      # only runs where those variables are configured.
       - name: PI smoke (optional)
-        if: ${{ env.PI_SMOKE == '1' }}
+        if: ${{ vars.PI_SMOKE == '1' }}
         env:
           PI_SMOKE: ${{ vars.PI_SMOKE }}
           PI_SMOKE_PROVIDER: ${{ vars.PI_SMOKE_PROVIDER }}
           PI_SMOKE_MODEL: ${{ vars.PI_SMOKE_MODEL }}
         run: ./scripts/pi-smoke.sh
+
+  release:
+    name: publish
+    # A tag is the only thing that publishes, and only after the same steps the
+    # matrix job runs. `--provenance` needs a public repository and the OIDC
+    # identity below; without those, drop the flag rather than the release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: node scripts/check-manifest.mjs
+      - run: node scripts/install-from-tarball.mjs
+
+      # The tag is the published version, or nothing is published.
+      - name: tag matches package.json
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const tag = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            if (pkg.version !== tag) {
+              console.error(`tag v${tag} does not match package.json ${pkg.version}`);
+              process.exit(1);
+            }
+            console.log(`publishing ${pkg.name}@${pkg.version}`);
+          '
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

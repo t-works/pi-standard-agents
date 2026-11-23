@@ -9,9 +9,13 @@
  *  - `dist/extension.js` is missing, or any `pi.extensions` path does not exist
  *  - `dist/` ships TypeScript source (`.d.ts` declarations are fine), a `.wasm`
  *    blob, or a copy of the runtime / quickjs
- *  - `@t-works/standardagents-runtime` is not a plain dependency
+ *  - `dist/` ships a source map, which the tarball gate also refuses
+ *  - `@t-works/standardagents-runtime` is not a plain dependency, is not pinned
+ *    to the range this repository tests, or the installed copy does not satisfy it
  *  - `quickjs-emscripten` leaks into our own dependencies (it is transitively ours)
  *  - a host package (PI, typebox) is a dependency instead of a peer
+ *  - `files` does not cover `dist`, `README.md`, `CHANGELOG.md` and `LICENSE`
+ *  - `CHANGELOG.md` carries no `## [<version>]` heading for this version
  */
 import { readFile, readdir } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
@@ -120,6 +124,9 @@ async function main() {
 		if (file.endsWith(".wasm")) {
 			fail(`dist file ${file}`, "quickjs wasm must stay in dependencies, not in dist/");
 		}
+		if (file.endsWith(".map")) {
+			fail(`dist file ${file}`, "source maps are dev-only, and the tarball gate refuses them");
+		}
 		if (/quickjs/i.test(file) || /standardagents-runtime/.test(file)) {
 			fail(`dist file ${file}`, "the runtime is a dependency, never bundled");
 		}
@@ -140,6 +147,29 @@ async function main() {
 		`${RUNTIME_PACKAGE} is published from the registry, not file:-linked`,
 		String(runtimeRange),
 	);
+
+	// The pin is the tested range, and the tested range is what `npm ci` installed:
+	// a runtime bump therefore has to move this string *and* the lockfile, which is
+	// what the changelog entry then describes.
+	const pinned = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(String(runtimeRange ?? ""));
+	expect(pinned !== null, `${RUNTIME_PACKAGE} is pinned to a caret range`, String(runtimeRange));
+	let installedRuntime = null;
+	try {
+		installedRuntime = JSON.parse(
+			await readFile(join(root, "node_modules", RUNTIME_PACKAGE, "package.json"), "utf8"),
+		).version;
+	} catch {
+		fail(`${RUNTIME_PACKAGE} is installed`, "run `npm ci` before the manifest gate");
+	}
+	if (pinned && typeof installedRuntime === "string") {
+		const [, major, minor, patch] = pinned;
+		const split = installedRuntime.split(".").map((part) => Number(part));
+		expect(
+			split[0] === Number(major) && split[1] === Number(minor) && split[2] >= Number(patch),
+			`${RUNTIME_PACKAGE}@${installedRuntime} satisfies the tested range ${runtimeRange}`,
+			`the pin and the installed copy disagree`,
+		);
+	}
 
 	// 4. quickjs-emscripten arrives through the runtime, never through us.
 	expect(!("quickjs-emscripten" in dependencies), "quickjs-emscripten is absent from dependencies");
@@ -171,7 +201,40 @@ async function main() {
 		String(pkg.engines?.node),
 	);
 
-	// 7. `npm test` runs against dist, not src.
+	// 7. The published docs are the ones shipping, and the release notes announce
+	// this version (`CHANGELOG.md` headings are what PI and npm read).
+	for (const file of ["README.md", "CHANGELOG.md", "LICENSE"]) {
+		expect(Array.isArray(pkg.files) && pkg.files.includes(file), `package.json "files" ships ${file}`);
+		expect(await exists(join(root, file)), `${file} exists at the repository root`);
+	}
+	if (await exists(join(root, "CHANGELOG.md"))) {
+		const changelog = await readFile(join(root, "CHANGELOG.md"), "utf8");
+		expect(
+			changelog.includes(`## [${pkg.version}]`),
+			`CHANGELOG.md has a "## [${pkg.version}]" heading`,
+			`the package is ${pkg.version}`,
+		);
+	}
+	const readme = (await exists(join(root, "README.md")))
+		? await readFile(join(root, "README.md"), "utf8")
+		: "";
+	expect(
+		readme.includes(`pi install npm:${pkg.name}`),
+		`README.md shows the "pi install npm:${pkg.name}" line`,
+	);
+	expect(
+		typeof pkg.version === "string" && /^\d+\.\d+\.\d+$/.test(pkg.version),
+		"package.json has a semver version of its own",
+		String(pkg.version),
+	);
+
+	// 8. The artifact gate itself ships in the repository, so "it was verified"
+	// never depends on a script somebody forgot to commit.
+	for (const script of ["scripts/install-from-tarball.mjs", "scripts/install-fixtures/loader.mjs"]) {
+		expect(await exists(join(root, script)), `${script} exists`);
+	}
+
+	// 9. `npm test` runs against dist, not src.
 	const testScript = pkg.scripts?.test ?? "";
 	expect(testScript.length > 0, "package.json has a test script");
 	expect(

@@ -1,73 +1,201 @@
 # pi-standard-agents
 
-A [PI](https://github.com/earendil-works/pi) extension package that exposes the
-Standard Agents runtime (`@t-works/standardagents-runtime`) to PI sessions:
-tools, slash commands and lifecycle hooks.
-
-This repository is built one unit at a time. U01 is the walking skeleton: an
-installable package with a single tool, the fake-PI test harness every later
-unit tests against, and the manifest gate.
-
-## Layout
-
-```
-package.json               package manifest: pi.extensions -> ./dist/extension.js
-tsconfig.json              src/ -> dist/, ESM, declarations, no bundler
-src/extension.ts           default factory: registers tools + lifecycle hooks
-test/fake-pi.ts            recorder implementing the ExtensionAPI surface we use
-test/*.test.ts             node:test suites (run against dist/)
-scripts/check-manifest.mjs the manifest gate CI runs after the build
-dist/                      build output; this is what PI loads and npm ships
-```
+A [PI](https://github.com/earendil-works/pi) extension that turns a JSON workflow file into a running
+team of [Standard Agents](https://github.com/standardagents) agents, without ever blocking your PI
+turn. You ask for a run in one tool call, get a run id back immediately, and the agents keep working
+in the background — each model call resolved through PI's own model registry and credentials, every
+run recorded under `.pi/standard-agents/runs/`, and one completion message when it ends. You can
+inspect a run (`/sa runs`, `/sa cost`), post a human message onto its thread, stop it, or follow its
+live lines; nothing runs until you start it, and the whole thing is a single extension file PI loads
+through `pi.extensions`.
 
 ## Install
 
 ```bash
-npm install pi-standard-agents
+pi install npm:pi-standard-agents
 ```
 
-PI discovers `./dist/extension.js` through the `pi.extensions` field of
-`package.json`. Load it explicitly in a session with:
+That is the whole install: PI supplies the host packages (`@earendil-works/pi-coding-agent`,
+`@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `typebox`) as peers, and the Standard
+Agents runtime comes in as this package's own dependency. To try a checkout instead:
 
 ```bash
+npm install --no-audit --no-fund && npm run build
 pi -e ./dist/extension.js
 ```
 
-## The one tool
+Requirements: Node **≥ 22.18**, and a PI version that accepts a default-factory extension.
 
-`std_smoke` takes an optional `note` and returns the fixed string
-`pong from pi-standard-agents`. It exists to prove the path
-default factory → tool registration → execute → result before any runtime code
-exists.
+## What you get
+
+| Surface | Name | What it does |
+| --- | --- | --- |
+| Tool | `standard_agent` | `start` / `status` / `message` / `stop` one run. `start` answers with a run id and a thread id in milliseconds. |
+| Command | `/sa` | `runs` (add `--follow` for live lines), `cost`, `stop <runId>`. Answers from disk, so it works when no run is live. |
+| Message | `standard-agent-run` | The completion wake: phase, revision, turns, tokens/cost and the last few live lines, folded by default. |
+| Tool | `std_smoke` | Returns a fixed string. Only there to prove the extension loaded and is reachable. |
+
+## A workflow file
+
+A workflow is data: an id, model names, prompts, and the agents that use them. `sides.a` is the
+model side, `sides.b.human` means "you are the other side". Below is a complete one — it lives at
+[`examples/workflow.json`](examples/workflow.json), and
+[`examples/library/`](examples/library) shows the prompt-library form.
+
+```json
+{
+  "id": "support-triage",
+  "models": [{ "name": "fast", "model": "gpt-4o-mini" }],
+  "prompts": [
+    {
+      "name": "shared_system",
+      "toolDescription": "Shared behaviour every agent in this workflow follows",
+      "prompt": "You are part of one team. Answer in the user's language and never invent policy.",
+      "model": "fast"
+    },
+    {
+      "name": "triage",
+      "toolDescription": "Route a support request to the specialist who can answer it",
+      "prompt": [
+        { "type": "text", "content": "You triage incoming support requests.\n\n" },
+        { "type": "include", "prompt": "shared_system" }
+      ],
+      "model": "fast",
+      "includeChat": true
+    }
+  ],
+  "agents": [
+    {
+      "name": "triage",
+      "title": "Support Triage",
+      "description": "Front door: understands the request and routes it",
+      "sides": { "a": { "prompt": "triage" }, "b": { "human": true } }
+    }
+  ]
+}
+```
+
+`models[].name` is the name the workflow uses; `models[].model` is the model id PI resolves. PI owns
+the registry and the keys, so a workflow file never carries a credential.
+
+Start it from a PI session, either by asking for the tool or by naming the file:
+
+```
+standard_agent start examples/workflow.json
+```
+
+```
+triage-1a2b3c4d triage running
+```
+
+The tool answers while the turn is still running — that is the point. The run ends with one
+completion message:
+
+```
+standard-agent run triage-1a2b3c4d idle: 4120 tokens over 6 call(s) $0.0042
+```
+
+Then, depending on what you want next:
+
+```
+/sa runs                 # every run on disk, with its phase and token total
+/sa cost                 # the same, cost-first (matches the journal)
+/sa runs --follow        # stream a run's live lines into the transcript
+/sa stop triage-1a2b3c4d # terminate the root threads; children cascade
+```
+
+Deadline: the runtime has no wall-clock cap of its own, so the host sets one. Leave
+`PI_STANDARD_AGENTS_DEADLINE_MS` unset for an unattended run with no horizon, or set it (e.g.
+`PI_STANDARD_AGENTS_DEADLINE_MS=900000`) and a run that overruns is recorded as `failed`/`deadline`
+and terminated.
+
+## Where runs live
+
+```
+.pi/standard-agents/runs/<runId>/
+  spec.json         the pinned spec and its revision (sha256 of the spec, first 12 chars)
+  journal.jsonl     append-only usage: one JSON object per line
+  owner.lock        the advisory owner claim (pid + start time)
+  store/
+    threads/<threadId>/thread.json     state, reason, children, termination
+    threads/<threadId>/messages.json   the thread's own conversation
+```
+
+Everything is a file, so a later process can pick a run up: a run keeps the spec it was created
+with, and a *changed* spec is a new run directory, never an edit underneath a live one.
+
+## What is sent to the model
+
+Only what the workflow declares, plus the thread's own conversation:
+
+- the system prompt the workflow's prompt renders — its `text` parts and any `include`s, in order;
+- the thread's message history from `messages.json` (limited by `includeChat` where a prompt sets it);
+- the tools the workflow declares for that agent;
+- the task text you passed to `start`, or a `message` you posted.
+
+PI's own built-in tools are not added on your behalf, and no file from your repository is read unless
+a workflow tool reads it. Each model call goes through PI's `ctx.modelRegistry`, so the key PI already
+holds is used and never copied into the run directory.
+
+## What is journaled
+
+`journal.jsonl` is append-only and holds four row kinds: `model_call` (provider, model, token usage
+and cost, exactly as reported), `tool` (name, status, duration, one-line redacted summary), `status`
+(lifecycle markers such as `running`, `failed`/`deadline`) and `usage_total` (the closing aggregate,
+written when the journal closes).
+
+Two rules keep it honest:
+
+- **Unknown is not zero.** A provider that reports no usage produces `usage: null` and a run total
+  marked `partial`, because "we did not measure it" and "it was free" are different facts.
+- **Request bodies never reach a row.** Prompts, message bodies and interpolated secrets stay out of
+  the journal; the fields are an allowlist, not a filter.
+
+`/sa cost` reads this file, which is why its numbers match a run nobody has open.
+
+## Dependency on the runtime
+
+`@t-works/standardagents-runtime` is a regular dependency, pinned to the range this repository tests
+(currently **`^0.2.1`**). It is not bundled: `dist/` holds our own compiled code only, and the
+runtime — with the `quickjs` engine it uses for sandboxed tool code — is loaded from `node_modules`.
+A runtime bump is a changelog entry in its own right, because narrowing or widening that range
+changes what a user installs underneath this extension.
+
+The host packages are peers with `"*"`: PI already has them, and shipping a second copy would give
+you two `ExtensionAPI`s.
+
+## One thing this does not do
+
+**There is no cross-process lease.** `owner.lock` is advisory: it names a pid and a start time, and a
+second process honours it only while that pid is alive and the lock is younger than 15 minutes. A
+reused pid, a container with a shared volume, or a clock jump defeats that check. The worst case is a
+stale lock — the run looks busy and a human removes the file — never silent corruption of a thread's
+`messages.json`, because the single-writer rule is enforced inside one process. If you need more than
+that, one run belongs on one machine.
 
 ## Development
 
 ```bash
 npm install --no-audit --no-fund
-npm run build                      # tsc: src/ -> dist/
-npm test                           # node --test test/ (offline, no model calls)
-node scripts/check-manifest.mjs    # manifest + dist gate
-npm pack --dry-run --json          # what gets published
+npm run build                       # tsc: src/ -> dist/ (no source maps in the tarball)
+npm test                            # node --test test/ (offline, no model calls)
+npm run check:manifest              # manifest + dist gate
+npm run verify:install              # pack, install the tarball in a temp dir, load it there
+npm run smoke                       # real PI, off unless PI_SMOKE=1 (see below)
 ```
 
-`node --test` runs the `.ts` sources directly, while tsc emits `dist/`, so
-relative imports inside `src/` carry the real `.ts` extension;
-`allowImportingTsExtensions` + `rewriteRelativeImportExtensions` in
-`tsconfig.json` turn them back into `.js` on emit.
+`npm test` runs the `.ts` sources directly while `tsc` emits `dist/`, so relative imports inside
+`src/` carry the real `.ts` extension; `allowImportingTsExtensions` +
+`rewriteRelativeImportExtensions` turn them back into `.js` on emit.
 
-`npm test` never reaches a model. The optional real-PI check is gated behind
-`PI_SMOKE=1` plus `PI_SMOKE_PROVIDER` / `PI_SMOKE_MODEL`, so CI names one cheap
-model explicitly instead of relying on ambient credentials.
+`npm run verify:install` is the only automated proof that the *published* tree works: it runs
+`npm pack`, installs the tarball into a clean temp directory together with a pinned PI host and
+`typebox`, and loads the extension from there. `dist` is what PI loads, so CI builds before it tests
+and every gate reads `dist`, never `src`.
 
-## Rules this package follows
-
-- The extension ABI is a **default factory**, sync or async. A named `activate`
-  export fails to load: `Extension does not export a valid factory function`.
-- `@t-works/standardagents-runtime` is a regular dependency; PI host packages
-  (`@earendil-works/pi-*`, `typebox`) are peers, supplied by PI at runtime.
-- Nothing is bundled: no `.wasm`, no runtime source in `dist/`.
-- `dist` is what PI loads, so CI builds before it tests and the manifest gate
-  reads `dist`, never `src`.
+`npm run smoke` is the optional real-PI check, gated behind `PI_SMOKE=1` plus
+`PI_SMOKE_PROVIDER` / `PI_SMOKE_MODEL`: CI names one cheap model explicitly instead of relying on
+whatever credentials happen to be on the machine.
 
 ## License
 

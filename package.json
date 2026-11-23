@@ -1,6 +1,6 @@
 {
   "name": "pi-standard-agents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "PI extension that exposes the Standard Agents runtime as tools, commands and lifecycle hooks.",
   "type": "module",
   "license": "MIT",
@@ -32,9 +32,13 @@
     "pi-extension"
   ],
   "scripts": {
+    "prebuild": "npm run clean",
     "build": "tsc",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "test": "node --test \"test/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\"",
+    "check:manifest": "node scripts/check-manifest.mjs",
+    "verify:install": "node scripts/install-from-tarball.mjs",
+    "smoke": "./scripts/pi-smoke.sh"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
