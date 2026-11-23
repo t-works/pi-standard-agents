@@ -6,10 +6,18 @@
  * a value rather than a directory. That is the whole difference from
  * `loadSource`, which walks the conventional `agents/` layout.
  *
- * Two guards replace what the loader used to give us:
+ * Three guards replace what the loader used to give us:
  *  - duplicate names, because a `Map` silently keeps the first entry;
  *  - reference checks, which `validateRegistry` already implements, so we call
- *    it instead of re-deriving prompt/handler/model/tool/subagent lookups.
+ *    it instead of re-deriving prompt/handler/model/tool/subagent lookups;
+ *  - include checks, which `validateRegistry` does *not* do and the runtime
+ *    silently tolerates: an `{type: "include"}` naming a prompt that does not
+ *    exist renders as nothing, so a typo quietly deletes instructions from the
+ *    system message. See {@link checkIncludes}.
+ *
+ * Prompt composition itself happens here, not in a build step: `library` prompts
+ * (`examples/library/*.json`) are registered alongside the workflow's own, so a
+ * workflow prompt composes them by name and the library stays data on disk.
  *
  * Validation runs *before* a `Runtime` is constructed on purpose: a runtime with
  * a missing model reference constructs happily and only fails on the first turn
@@ -80,6 +88,19 @@ export interface PromptSpec {
 }
 
 /**
+ * One prompt from the prompt library.
+ *
+ * A library prompt is never an agent and is never called: it exists to be
+ * `include`d by a workflow prompt, so it needs no model of its own. When `model`
+ * is omitted it inherits the workflow's first model, which keeps a library file
+ * portable across workflows that name their models differently.
+ */
+export interface LibraryPromptSpec extends Omit<PromptSpec, "model"> {
+	/** Optional; defaults to the workflow's first model. */
+	model?: string;
+}
+
+/**
  * One model. `provider` may be omitted in a spec file (JSON cannot carry a
  * function); pass a factory for it through `BuildRegistryOptions.providers`.
  */
@@ -113,6 +134,11 @@ export interface WorkflowSpec {
 	id: string;
 	agents: readonly AgentSpec[];
 	prompts: readonly PromptSpec[];
+	/**
+	 * Shared prompts from `examples/library/`. Registered, never agents: no
+	 * agent points at one, they are only reachable through `{type: "include"}`.
+	 */
+	library?: readonly LibraryPromptSpec[];
 	models: readonly ModelSpec[];
 	hooks?: readonly HookSpec[];
 	tools?: readonly ToolSpec[];
@@ -218,6 +244,38 @@ function putDefinition<T>(
 }
 
 /**
+ * Report `{type: "include"}` parts that name a prompt nothing resolves.
+ *
+ * `Runtime.renderPrompt` skips an include it cannot find, so an unknown name
+ * renders as nothing at all: the system message silently loses a block of
+ * instructions and nothing else in the run looks wrong. `validateRegistry` does
+ * not look inside prompt content, so this pass is the only place it is caught.
+ *
+ * The path names the offending part — `prompts.<n>.prompt[<i>].prompt` — because
+ * a prompt can carry several includes and the index is the only way to tell
+ * which one is wrong.
+ */
+function checkIncludes(spec: WorkflowSpec, registry: Registry, issues: DefinitionIssue[]): void {
+	const walk = (label: string, content: PromptContent | undefined): void => {
+		if (!Array.isArray(content)) return;
+		for (const [index, part] of content.entries()) {
+			if (part.type !== "include") continue;
+			if (registry.prompts.has(unqualify(part.prompt))) continue;
+			issues.push({
+				code: "agent_side_invalid",
+				severity: "error",
+				message:
+					`'${label}[${index}]' includes undefined prompt '${part.prompt}' in workflow ` +
+					`'${spec.id}': the runtime renders nothing for a missing include`,
+				path: `${label}[${index}].prompt`,
+			});
+		}
+	};
+	for (const [index, prompt] of (spec.prompts ?? []).entries()) walk(`prompts.${index}.prompt`, prompt.prompt);
+	for (const [index, prompt] of (spec.library ?? []).entries()) walk(`library.${index}.prompt`, prompt.prompt);
+}
+
+/**
  * Turn one declared side into a runtime side.
  *
  * The backing is chosen at runtime because the spec is data, so the object is
@@ -297,9 +355,10 @@ function buildTool(spec: ToolSpec): ToolDefinition {
 /**
  * Build the `Registry` a `Runtime` accepts from a workflow spec.
  *
- * Returns every issue it found: our duplicate checks plus `validateRegistry`'s
- * reference checks (undefined prompt/handler/model/tool/subagent targets, which
- * is also how a workflow edge to a missing agent is caught).
+ * Returns every issue it found: our duplicate checks, our include checks, plus
+ * `validateRegistry`'s reference checks (undefined prompt/handler/model/tool/
+ * subagent targets, which is also how a workflow edge to a missing agent is
+ * caught).
  *
  * Fails closed: with `strict` (the default) any error throws
  * `RegistryBuildError` carrying the issues, so a host never constructs a
@@ -312,12 +371,26 @@ export function buildRegistry(
 ): BuildRegistryResult {
 	const registry = emptyRegistry();
 	const issues: DefinitionIssue[] = [];
+	// A library prompt is never called, so `model` only has to name something the
+	// registry can resolve; the workflow's first model is the least surprising
+	// default and keeps a library file free of a workflow's model names.
+	const fallbackModel = spec.models?.[0]?.name ?? "";
 
 	for (const agent of spec.agents ?? []) {
 		putDefinition(registry, "agents", agent.name, buildAgent(agent), spec, issues);
 	}
 	for (const prompt of spec.prompts ?? []) {
 		putDefinition(registry, "prompts", prompt.name, buildPrompt(prompt), spec, issues);
+	}
+	for (const prompt of spec.library ?? []) {
+		putDefinition(
+			registry,
+			"prompts",
+			prompt.name,
+			buildPrompt({ ...prompt, model: prompt.model ?? fallbackModel }),
+			spec,
+			issues,
+		);
 	}
 	for (const model of spec.models ?? []) {
 		putDefinition(registry, "models", model.name, buildModel(model, options), spec, issues);
@@ -329,6 +402,9 @@ export function buildRegistry(
 		putDefinition(registry, "tools", tool.name, buildTool(tool), spec, issues);
 	}
 
+	// After every prompt is registered: an include may point at a library prompt,
+	// which only exists once the whole spec has been walked.
+	checkIncludes(spec, registry, issues);
 	issues.push(...validateRegistry(registry));
 
 	if ((options.strict ?? true) && issues.some((issue) => issue.severity === "error")) {

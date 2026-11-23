@@ -43,7 +43,15 @@ import type { ThreadRecord } from "@t-works/standardagents-runtime/store";
 
 import type { Journal } from "./journal.ts";
 import { openJournal } from "./journal.ts";
-import type { AgentSpec, HookSpec, ModelSpec, PromptSpec, ToolSpec, WorkflowSpec } from "./registry.ts";
+import type {
+	AgentSpec,
+	HookSpec,
+	LibraryPromptSpec,
+	ModelSpec,
+	PromptSpec,
+	ToolSpec,
+	WorkflowSpec,
+} from "./registry.ts";
 import { buildRegistry } from "./registry.ts";
 
 /** Path segments below the working directory a run directory lives under. */
@@ -110,6 +118,12 @@ export interface RunSpecData {
 	id: string;
 	agents: readonly AgentSpec[];
 	prompts: readonly PromptSpec[];
+	/**
+	 * Shared prompts the workflow's own prompts compose by name (U07). Pinned with
+	 * the rest of the spec: a library prompt is part of what the run was built
+	 * from, so changing one is a new revision, not a silent edit to a live run.
+	 */
+	library?: readonly LibraryPromptSpec[];
 	models: readonly Omit<ModelSpec, "provider">[];
 	hooks?: readonly { id: string; hook: HookName }[];
 	tools?: readonly Omit<ToolSpec, "execute">[];
@@ -345,6 +359,9 @@ function hydrate(data: RunSpecData, code: { tools?: readonly ToolSpec[]; hooks?:
 		id: data.id,
 		agents: data.agents,
 		prompts: data.prompts,
+		// Kept apart from `prompts` on purpose: a library prompt is included by
+		// name, so a reopened run must resolve the same includes the pinned spec had.
+		...(data.library === undefined ? {} : { library: data.library }),
 		models: data.models,
 		tools,
 		hooks,

@@ -1,0 +1,5 @@
+{
+  "name": "answer_style",
+  "toolDescription": "How an answer is laid out",
+  "prompt": "Lead with the answer, then the reason. Quote figures only from the thread context.\n"
+}
