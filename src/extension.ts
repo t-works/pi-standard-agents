@@ -32,12 +32,21 @@ import { unqualify } from "@t-works/standardagents-runtime/loader";
 import type { Static } from "typebox";
 import { Type } from "typebox";
 
+import type { EventLine, EventSink, RunReport } from "./events.ts";
+import {
+	LINE_MESSAGE_TYPE,
+	LineLog,
+	RUN_MESSAGE_TYPE,
+	RunSubscriptions,
+	registerStandardAgentCommand,
+	runMessageRenderer,
+} from "./events.ts";
 import type { JournalTotal } from "./journal.ts";
 import type { ModelCall } from "./models.ts";
 import { piModel, withUsage } from "./models.ts";
 import type { ModelSpec, ToolSpec, WorkflowSpec } from "./registry.ts";
-import type { RunPhase, RunStatus } from "./runs.ts";
-import { JOURNAL_FILE, RunError, RunService, shutdownRunService } from "./runs.ts";
+import type { OpenRun, RunPhase, RunStatus } from "./runs.ts";
+import { JOURNAL_FILE, RUNS_DIR, RunError, RunService, shutdownRunService } from "./runs.ts";
 
 /** Name of the walking-skeleton tool. */
 export const PING_TOOL_NAME = "std_smoke";
@@ -48,8 +57,11 @@ export const PING_RESULT = "pong from pi-standard-agents";
 /** Name of the tool that drives the runtime. */
 export const STANDARD_AGENT_TOOL_NAME = "standard_agent";
 
-/** `customType` of the completion wake; U06 registers the renderer for it. */
-export const COMPLETION_CUSTOM_TYPE = "standard-agent-run";
+/**
+ * `customType` of the completion wake. The value is `events.ts`'s, so the
+ * renderer, the wake and a followed line can never drift apart.
+ */
+export const COMPLETION_CUSTOM_TYPE = RUN_MESSAGE_TYPE;
 
 /** Where the host's default deadline comes from. Unset means "no horizon". */
 export const DEADLINE_ENV = "PI_STANDARD_AGENTS_DEADLINE_MS";
@@ -108,6 +120,23 @@ export interface StandardAgentToolOptions {
 	store?: { envKey?: string; keyFile?: string };
 	/** The service to open runs with. The extension factory supplies one so it can close it. */
 	service?: RunService;
+	/**
+	 * Where this session keeps the live lines of each run (U06). The factory
+	 * supplies one; a wake then carries the last few lines without a second
+	 * subscription or a polling timer.
+	 */
+	lines?: LineLog;
+	/**
+	 * Called once per run this tool opens, before anything is generated — so a
+	 * session subscribes before the first event exists and never misses one.
+	 */
+	onOpen?: (run: OpenRun) => void;
+	/**
+	 * Called once a run has spoken to the transcript (its completion wake). From
+	 * then on its live lines are visible too: a run already on screen should stay
+	 * readable, and a run nobody is watching stays quiet.
+	 */
+	onScreen?: (runId: string) => void;
 }
 
 /** The slice of context every action reads: cwd plus PI's model registry. */
@@ -287,6 +316,42 @@ export function journalUsage(runDir: string): JournalTotal {
 	return total.calls === 0 && closed ? closed : total;
 }
 
+/**
+ * Every run on disk, as `/sa` reports it.
+ *
+ * Read through `status()` (records, revision, phase) plus the journal total, so
+ * `/sa` answers with no run open — which is the state an operator is in when a
+ * run matters most. A directory that is not a run is skipped, not reported as
+ * one: a half-written run is not a run.
+ */
+export async function listRuns(service: RunService, cwd: string): Promise<RunReport[]> {
+	const root = join(resolve(cwd), ...RUNS_DIR);
+	let names: string[];
+	try {
+		names = readdirSync(root, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name);
+	} catch {
+		return []; // No runs directory yet: nothing has ever run here.
+	}
+	const reports: RunReport[] = [];
+	for (const name of names.sort()) {
+		try {
+			const view = await service.status(name);
+			reports.push({
+				runId: view.runId,
+				revision: view.revision,
+				phase: view.phase,
+				threads: view.threads.length,
+				usage: journalUsage(view.runDir),
+			});
+		} catch {
+			// Not a run (or no longer readable): `/sa` lists runs, it does not repair them.
+		}
+	}
+	return reports;
+}
+
 /** Where a thread stands once the runtime has stopped running it. */
 function endedPhase(record: { terminated?: number | null; status?: { state: string } } | null): RunPhase {
 	if (!record) return "idle";
@@ -444,6 +509,9 @@ export function createStandardAgentTool(
 		const runService = serviceFor(cwd);
 		const open = await runService.create(spec, { cwd });
 		sink = open.journal.modelCallSink();
+		// Before the first thread, before the first turn: a subscription attached
+		// later would miss the events that matter most (the run's opening lines).
+		options.onOpen?.(open);
 
 		const thread = await open.runtime.createThread({ agentId: agent });
 		await thread.queueMessage({ role: "user", content: task }, { trigger: false });
@@ -469,6 +537,9 @@ export function createStandardAgentTool(
 			}
 			const usage = journalUsage(run.runDir);
 			const cost = usage.cost === null ? "" : ` $${usage.cost.toFixed(4)}`;
+			// The renderer needs the last lines now: a message is plain data, and a
+			// timer that refreshed it would be a timer this extension does not want.
+			const lines: readonly EventLine[] = options.lines?.recent(run.runId) ?? [];
 			try {
 				pi.sendMessage(
 					{
@@ -477,10 +548,23 @@ export function createStandardAgentTool(
 							`standard-agent run ${run.runId} ${phase}: ` +
 							`${usage.totalTokens} tokens over ${usage.calls} call(s)${cost}`,
 						display: true,
-						details: { runId: run.runId, threadId: run.threadId, agent: run.agent, phase, usage },
+						details: {
+							runId: run.runId,
+							threadId: run.threadId,
+							agent: run.agent,
+							phase,
+							revision: run.revision,
+							// Each model call is one turn of the loop: the journal is the count.
+							turns: usage.calls,
+							usage,
+							lines,
+						},
 					},
 					{ triggerTurn: true },
 				);
+				// The run is in the transcript now, so its lines may be shown from here
+				// on. Before this point a line would be a message about nothing.
+				options.onScreen?.(run.runId);
 			} catch {
 				// A host that cannot take the message must not lose the run: the journal
 				// and the thread store are the durable answer.
@@ -693,16 +777,62 @@ export default function standardAgentsExtension(
 		...(options.store === undefined ? {} : { store: options.store }),
 	});
 
+	// The session's live view: a bounded ring per run and the runs the user asked
+	// to follow. Neither is a setting — a line per tool call in the transcript is
+	// noise nobody opted into.
+	const lines = options.lines ?? new LineLog();
+	const following = new Set<string>();
+	let subscriptions: RunSubscriptions | null = null;
+
+	const sink: EventSink = (line) => {
+		// Every line is kept, because the completion wake carries the last few of
+		// them; only a run the user is watching is also written to the transcript.
+		lines.append(line);
+		if (!following.has(line.runId)) return;
+		try {
+			pi.sendMessage(
+				{ customType: LINE_MESSAGE_TYPE, content: line.text, display: true, details: line },
+				{},
+			);
+		} catch {
+			// A host that cannot take a line is not a reason to stop the run.
+		}
+	};
+
 	pi.registerTool(pingTool());
-	pi.registerTool(createStandardAgentTool(pi, { ...options, service }));
+	pi.registerTool(
+		createStandardAgentTool(pi, {
+			...options,
+			service,
+			lines,
+			onOpen: (run) => subscriptions?.attach(run),
+			onScreen: (runId) => following.add(runId),
+		}),
+	);
+
+	// The renderer is registered here, unconditionally: the wake it draws is sent
+	// by the tool, and a renderer registered later would miss the first wake.
+	pi.registerMessageRenderer(COMPLETION_CUSTOM_TYPE, runMessageRenderer());
+
+	registerStandardAgentCommand(pi, {
+		runs: () => listRuns(service, options.cwd ?? process.cwd()),
+		stop: (runId) => service.stop(runId),
+		follow: (runIds) => {
+			for (const runId of runIds) following.add(runId);
+		},
+	});
 
 	// Lifecycle wiring. Nothing runs at factory time: `close()` releases a claim
 	// only for a run that actually took one, so a reload never leaves an orphan
 	// owner.lock behind.
 	pi.on("session_start", () => {
-		// A run is opened on demand, never at session start.
+		// The subscription window opens here and every run this session opens is
+		// attached as it opens; a run is never opened at session start.
+		subscriptions = new RunSubscriptions(sink);
 	});
 	pi.on("session_shutdown", () => {
+		subscriptions?.close();
+		subscriptions = null;
 		service.close();
 		shutdownRunService();
 	});

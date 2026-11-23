@@ -4,6 +4,7 @@ import { test } from "node:test";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import extension, {
+	COMPLETION_CUSTOM_TYPE,
 	PING_RESULT,
 	PING_TOOL_NAME,
 	STANDARD_AGENT_TOOL_NAME,
@@ -31,7 +32,15 @@ test("default factory registers both tools and the session lifecycle handlers", 
 		fakePi.handlers.map((h) => h.event),
 		["session_start", "session_shutdown"],
 	);
-	assert.deepEqual(fakePi.commands, []);
+	// U06: one command for the run list and one renderer for the completion wake.
+	assert.deepEqual(
+		fakePi.commands.map((command) => command.name),
+		["sa"],
+	);
+	assert.deepEqual(
+		fakePi.messageRenderers.map((renderer) => renderer.customType),
+		[COMPLETION_CUSTOM_TYPE],
+	);
 });
 
 test("the registered tool's execute returns the fixed string", async () => {
@@ -69,4 +78,6 @@ test("a second factory call on a fresh recorder registers again", async () => {
 	);
 	assert.equal(first.handlers.length, 2);
 	assert.equal(second.handlers.length, 2);
+	assert.equal(first.commands.length, 1);
+	assert.equal(second.commands.length, 1);
 });

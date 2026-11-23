@@ -214,8 +214,15 @@ export interface OpenRun {
 	tookOverLock: boolean;
 	/** The lock this service wrote. `close()` releases it only while it still matches. */
 	lock: OwnerLock;
-	/** Runtime events seen since the run was opened. U06 wires the real fan-out. */
+	/** Runtime events seen since the run was opened. */
 	events(): number;
+	/**
+	 * Subscribe to this run's runtime events (U06). The run's `Runtime` owns one
+	 * `onEvent` wrapper, created when the run was opened; every listener is fanned
+	 * out from it, so a session can watch a run without reaching into the runtime.
+	 * Returns the unsubscribe; a listener that throws never ends a turn.
+	 */
+	listen(listener: (event: RuntimeEvent) => void): () => void;
 }
 
 /** Options for {@link RunService}. Everything a host has to supply in code lives here. */
@@ -641,12 +648,22 @@ export class RunService {
 		const journal = openJournal(input.runDir, { fileName: JOURNAL_FILE });
 		const store = new ThreadStore(join(input.runDir, STORE_DIR), this.options.store ?? {});
 		const counter = { events: 0 };
+		/** This run's subscribers: one `onEvent` wrapper, many listeners (U06). */
+		const listeners = new Set<(event: RuntimeEvent) => void>();
 		const runtime = new Runtime({
 			store,
 			registry: input.registry,
 			onEvent: (event: RuntimeEvent) => {
 				counter.events += 1;
 				this.options.onEvent?.(event);
+				// A copy, so a listener may unsubscribe while it is being notified.
+				for (const listener of [...listeners]) {
+					try {
+						listener(event);
+					} catch {
+						// A view that throws must not fail the turn it is watching.
+					}
+				}
 			},
 			...(this.options.maxSteps === undefined ? {} : { maxSteps: this.options.maxSteps }),
 			...(this.options.maxTotalSteps === undefined ? {} : { maxTotalSteps: this.options.maxTotalSteps }),
@@ -680,6 +697,12 @@ export class RunService {
 			tookOverLock: input.tookOverLock,
 			lock,
 			events: () => counter.events,
+			listen(listener) {
+				listeners.add(listener);
+				return () => {
+					listeners.delete(listener);
+				};
+			},
 		};
 		this.runs.set(input.runDir, open);
 		return open;
