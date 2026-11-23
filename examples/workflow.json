@@ -1,0 +1,78 @@
+{
+  "id": "support-triage",
+  "models": [
+    {
+      "name": "fast",
+      "model": "gpt-4o-mini"
+    }
+  ],
+  "prompts": [
+    {
+      "name": "shared_system",
+      "toolDescription": "Shared behaviour every agent in this workflow follows",
+      "prompt": "You are part of one team. Answer in the user's language and never invent policy.",
+      "model": "fast"
+    },
+    {
+      "name": "triage",
+      "toolDescription": "Route a support request to the specialist who can answer it",
+      "prompt": [
+        {
+          "type": "text",
+          "content": "You triage incoming support requests. Ask one clarifying question when the request is ambiguous.\n\n"
+        },
+        {
+          "type": "include",
+          "prompt": "shared_system"
+        }
+      ],
+      "model": "fast",
+      "includeChat": true
+    },
+    {
+      "name": "billing",
+      "toolDescription": "Answer billing and invoice questions",
+      "prompt": [
+        {
+          "type": "text",
+          "content": "You are the billing specialist. Quote figures only from the thread context.\n\n"
+        },
+        {
+          "type": "include",
+          "prompt": "shared_system"
+        }
+      ],
+      "model": "fast",
+      "includeChat": true
+    }
+  ],
+  "agents": [
+    {
+      "name": "triage",
+      "title": "Support Triage",
+      "description": "Front door: understands the request and routes it",
+      "sides": {
+        "a": {
+          "prompt": "triage"
+        },
+        "b": {
+          "human": true
+        }
+      }
+    },
+    {
+      "name": "billing",
+      "title": "Billing Specialist",
+      "description": "Answers invoice and payment questions",
+      "sides": {
+        "a": {
+          "prompt": "billing",
+          "maxSteps": 4
+        },
+        "b": {
+          "human": true
+        }
+      }
+    }
+  ]
+}
