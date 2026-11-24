@@ -7,7 +7,7 @@ change to the runtime range is called out in the entry that makes it.
 
 ## [Unreleased]
 
-## [0.2.0]
+## [0.0.1]
 
 The first release meant for somebody else's machine: one tool, one command, one
 renderer, a published tarball CI installs and loads, and a README that says what
