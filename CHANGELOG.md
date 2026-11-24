@@ -7,6 +7,11 @@ change to the runtime range is called out in the entry that makes it.
 
 ## [Unreleased]
 
+### Changed
+
+- Dependency on `@t-works/standardagents-runtime` (the Standard Agents runtime this extension
+  drives) narrowed from `^0.2.1` to `^0.2.4`: what the tests run against is what a user installs.
+
 ## [0.0.1]
 
 The first release meant for somebody else's machine: one tool, one command, one

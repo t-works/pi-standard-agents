@@ -17,7 +17,8 @@ pi install npm:pi-standard-agents
 
 That is the whole install: PI supplies the host packages (`@earendil-works/pi-coding-agent`,
 `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `typebox`) as peers, and the Standard
-Agents runtime comes in as this package's own dependency. To try a checkout instead:
+Agents runtime (`@t-works/standardagents-runtime`, the engine that runs the agents) comes in as this
+package's own dependency. To try a checkout instead:
 
 ```bash
 npm install --no-audit --no-fund && npm run build
@@ -156,7 +157,7 @@ Two rules keep it honest:
 ## Dependency on the runtime
 
 `@t-works/standardagents-runtime` is a regular dependency, pinned to the range this repository tests
-(currently **`^0.2.1`**). It is not bundled: `dist/` holds our own compiled code only, and the
+(currently **`^0.2.4`**). It is not bundled: `dist/` holds our own compiled code only, and the
 runtime — with the `quickjs` engine it uses for sandboxed tool code — is loaded from `node_modules`.
 A runtime bump is a changelog entry in its own right, because narrowing or widening that range
 changes what a user installs underneath this extension.

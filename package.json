@@ -1,7 +1,7 @@
 {
   "name": "pi-standard-agents",
   "version": "0.0.1",
-  "description": "PI extension that exposes the Standard Agents runtime as tools, commands and lifecycle hooks.",
+  "description": "PI integration for @t-works/standardagents-runtime — exposes the Standard Agents runtime as tools, commands and lifecycle hooks.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -52,7 +52,7 @@
     "typebox": "*"
   },
   "dependencies": {
-    "@t-works/standardagents-runtime": "^0.2.1"
+    "@t-works/standardagents-runtime": "^0.2.4"
   },
   "devDependencies": {
     "@standardagents/spec": "^0.45.10",
