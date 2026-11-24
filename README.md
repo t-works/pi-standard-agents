@@ -138,6 +138,29 @@ PI's own built-in tools are not added on your behalf, and no file from your repo
 a workflow tool reads it. Each model call goes through PI's `ctx.modelRegistry`, so the key PI already
 holds is used and never copied into the run directory.
 
+## Tools a workflow may declare
+
+A workflow file is data, so it can only *name* a tool: `"tools": [{ "name": "shell", "description": "run a
+command" }]` at the top level, and `"tools": ["shell"]` on the prompt that may call it. This package
+supplies the implementations for five names, so a run needs no host code:
+
+| Name | What it does |
+| --- | --- |
+| `shell` | one command in the run's working directory; the exit code and the raw tail of its output (a non-zero exit is a result, not a tool failure) |
+| `read` | a text file inside that directory, truncated with a note when it is large |
+| `write` | one whole file, parent directories created |
+| `edit` | one exact passage, refused when it occurs zero or several times |
+| `list` | names under a directory, directories with a trailing slash, `.git` / `node_modules` / `.pi` skipped |
+
+Declaration is the whole grant: a workflow that names none of these gets none of them, and nothing is
+added on an agent's behalf. The fence is the run's working directory — `shell` is a real shell that can
+write anywhere, the four file tools refuse a path outside it. A name that nothing implements fails at
+run start, naming the prompt and the tool, so a typo is caught before the first model call.
+
+A host may override any of these or add its own by passing `tools` to `createStandardAgentTool`, and may
+register the tool under its own name (`{ name: "factory_agent", tools }`) so it sits beside this
+package's `standard_agent` rather than colliding with it.
+
 ## What is journaled
 
 `journal.jsonl` is append-only and holds four row kinds: `model_call` (provider, model, token usage

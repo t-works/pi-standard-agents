@@ -485,3 +485,43 @@ test("a deadline records failed/deadline and wakes once, even though the provide
 	const ended = await call<StatusDetails>(h, { action: "status", runId: started.details.runId });
 	assert.equal(ended.details.runs[0]?.phase, "terminated", "terminate() is what ended the thread");
 });
+
+// ── built-in tools ──────────────────────────────────────────────────────────
+
+test("a workflow that declares 'shell' runs it with no host tools supplied", async (t) => {
+	const root = await tempRoot(t);
+	await writeWorkflow(root, "declares-shell", {
+		...assistantWorkflow(),
+		prompts: [
+			{
+				name: "assistant",
+				toolDescription: "Answer the user",
+				prompt: "You are the assistant.",
+				model: "scripted",
+				includeChat: true,
+				tools: ["shell"],
+			},
+		],
+		// The declaration is the grant; the implementation comes from the package, so
+		// a bare PI session (no `tools` option) can run it.
+		tools: [{ name: "shell", description: "Run one command in the working directory." }],
+	});
+	const provider = delayingProvider([
+		{ toolCalls: [{ id: "call_shell", name: "shell", arguments: { command: "echo built-in" } }] },
+		{ content: "ran it", usage: TOKENS },
+	]);
+	const h = await harness(t, root, { providers: { scripted: provider } });
+
+	const started = await call<StartDetails>(h, { action: "start", workflow: "declares-shell", task: "list something" });
+	assert.equal(started.isError, undefined, started.content[0]?.text);
+
+	await until(() => wakes(h.fakePi).length === 1, "the completion wake");
+
+	// `echo built-in` is a string only the built-in could have produced: the scripted
+	// model never says it, so its presence in the thread is the execution's own mark.
+	const messages = await readFile(
+		join(threadDir(runDirOf(root, started.details.runId), started.details.threadId), "messages.json"),
+		"utf8",
+	);
+	assert.match(messages, /exit: 0[\s\S]*built-in/, "the declared tool ran, and it was the built-in");
+});

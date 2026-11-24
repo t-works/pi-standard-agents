@@ -81,3 +81,19 @@ test("a second factory call on a fresh recorder registers again", async () => {
 	assert.equal(first.commands.length, 1);
 	assert.equal(second.commands.length, 1);
 });
+
+test("the tool can be registered under a host's own name", async () => {
+	const fakePi = createFakePi();
+
+	await extension(fakePi.api, { name: "factory_agent" });
+
+	const names = fakePi.tools.map((tool) => tool.name);
+	assert.deepEqual(names, [PING_TOOL_NAME, "factory_agent"], "a host names its own tool");
+	assert.equal(
+		names.includes(STANDARD_AGENT_TOOL_NAME),
+		false,
+		"so it does not collide with the package's registration",
+	);
+	const tool = toolNamed(fakePi.tools, "factory_agent");
+	assert.match(tool.promptSnippet ?? "", /^factory_agent:/, "the snippet names the tool the model sees");
+});

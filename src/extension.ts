@@ -45,6 +45,7 @@ import type { JournalTotal } from "./journal.ts";
 import type { ModelCall } from "./models.ts";
 import { piModel, withUsage } from "./models.ts";
 import type { ModelSpec, ToolSpec, WorkflowSpec } from "./registry.ts";
+import { withBuiltinTools } from "./builtin-tools.ts";
 import type { OpenRun, RunPhase, RunStatus } from "./runs.ts";
 import { JOURNAL_FILE, RUNS_DIR, RunError, RunService, shutdownRunService } from "./runs.ts";
 
@@ -103,12 +104,19 @@ export interface StandardAgentToolOptions {
 	/** Where runs, workflow files and `examples/` live. Defaults to the PI session's cwd. */
 	cwd?: string;
 	/**
+	 * The tool's own name. A host that supplies its own tool set registers it under
+	 * its own name, so the package's `/sa` surface and the host's tool coexist.
+	 * Defaults to `standard_agent`.
+	 */
+	name?: string;
+	/**
 	 * Provider factories by model name, for models a workflow file declares without
 	 * one. A workflow file is data — it cannot carry a function — so this is also
 	 * how a test supplies a scripted model.
 	 */
 	providers?: Readonly<Record<string, ProviderFactory>>;
-	/** Tool implementations by name, for tools a workflow file only declares. */
+	/** Tool implementations by name, for tools a workflow file only declares. These win
+	 * over the built-ins (`builtin-tools.ts`) when both carry a name. */
 	tools?: readonly ToolSpec[];
 	/**
 	 * Wall-clock cap for one run. The default comes from
@@ -479,7 +487,9 @@ export function createStandardAgentTool(
 	async function start(params: StandardAgentParams, ctx: ToolContext) {
 		const cwd = resolve(options.cwd ?? ctx?.cwd ?? process.cwd());
 		const path = resolveWorkflowPath(required(params, "workflow"), cwd);
-		const loaded = loadWorkflow(path, { tools: options.tools });
+		// The built-ins are the implementation side of a workflow's tool declarations:
+		// a file can name `shell`, only code can run it.
+		const loaded = loadWorkflow(path, { tools: withBuiltinTools(cwd, options.tools) });
 		const agent = unqualify(params.agent ?? loaded.spec.agents[0]?.name ?? "");
 		if (!agent) {
 			throw new ToolError("workflow_invalid", `'${path}' declares no agent and none was named`);
@@ -715,12 +725,12 @@ export function createStandardAgentTool(
 	}
 
 	return {
-		name: STANDARD_AGENT_TOOL_NAME,
+		name: options.name ?? STANDARD_AGENT_TOOL_NAME,
 		label: "Standard Agent",
 		description:
 			"Start, inspect, message and stop a Standard Agents run. `start` returns immediately with a run id " +
 			"and a thread id; the run continues in the background and reports completion as a message.",
-		promptSnippet: `${STANDARD_AGENT_TOOL_NAME}: start/inspect/message/stop a Standard Agents run`,
+		promptSnippet: `${options.name ?? STANDARD_AGENT_TOOL_NAME}: start/inspect/message/stop a Standard Agents run`,
 		parameters: STANDARD_AGENT_PARAMETERS,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const action = params.action;

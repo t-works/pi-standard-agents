@@ -7,8 +7,26 @@ change to the runtime range is called out in the entry that makes it.
 
 ## [Unreleased]
 
+## [0.1.0]
+
+A workflow can now do work, not only talk: the five tool names it may declare have implementations
+shipped with the package, and a host can register the run tool under its own name.
+
+### Added
+
+- Built-in tool implementations for the five names a workflow file may declare — `shell`, `read`,
+  `write`, `edit`, `list` — bound to the run's working directory. Until now a workflow's `tools` were
+  declarations only: the implementation had to come from an embedder, and a plain PI session passed
+  none, so a workflow could not touch a repository. The file tools refuse a path outside the run's
+  working directory; `shell` is a real shell, as `bash` is in PI itself.
+- `createStandardAgentTool(pi, { name })` registers the run tool under a host's own name, so a
+  repository can supply its own tool set beside the package's `standard_agent` instead of colliding
+  with it.
+
 ### Changed
 
+- `ToolSpec` accepts a real argument schema and a schema-typed `execute`: `ToolDefinition["args"]`
+  resolves to `null` at its default generic, which made a schema-carrying tool unrepresentable.
 - Dependency on `@t-works/standardagents-runtime` (the Standard Agents runtime this extension
   drives) narrowed from `^0.2.1` to `^0.2.4`: what the tests run against is what a user installs.
 

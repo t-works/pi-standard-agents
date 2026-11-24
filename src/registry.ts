@@ -33,7 +33,10 @@ import type {
 	ProviderFactory,
 	SideConfig,
 	SubagentRelationship,
+	ThreadState,
+	ToolArgs,
 	ToolDefinition,
+	ToolResult,
 } from "@standardagents/spec";
 import type { AnyHook, Registry } from "@t-works/standardagents-runtime/loader";
 import { formatIssues, unqualify, validateRegistry } from "@t-works/standardagents-runtime/loader";
@@ -122,8 +125,18 @@ export interface HookSpec {
 export interface ToolSpec {
 	name: string;
 	description: string;
-	args?: ToolDefinition["args"];
-	execute: ToolDefinition["execute"];
+	/**
+	 * Zod schema for the tool's arguments, or `null` for none. Typed as the spec's own
+	 * `ToolArgs` because `ToolDefinition["args"]` resolves to `null` at its default
+	 * generic — which would make a schema-carrying tool unrepresentable here.
+	 */
+	args?: ToolArgs | null;
+	/**
+	 * The implementation. `args` is `never` so one interface can hold any schema: every
+	 * concrete argument type is assignable to `never` in a parameter position, and the
+	 * runtime hands the call what the schema parsed.
+	 */
+	execute: (state: ThreadState, args: never) => Promise<ToolResult>;
 	variables?: ToolDefinition["variables"];
 	executionMode?: ToolDefinition["executionMode"];
 }
@@ -344,8 +357,10 @@ function buildHook(spec: HookSpec): AnyHook {
 function buildTool(spec: ToolSpec): ToolDefinition {
 	const tool: ToolDefinition = {
 		description: spec.description,
-		args: spec.args ?? null,
-		execute: spec.execute,
+		// The spec's own runtime reads the schema this way; the cast is the one place the
+		// erased `ToolSpec.execute`/`args` types meet the generic `ToolDefinition`.
+		args: (spec.args ?? null) as ToolDefinition["args"],
+		execute: spec.execute as unknown as ToolDefinition["execute"],
 		variables: spec.variables ?? [],
 		tenvs: null,
 	};
