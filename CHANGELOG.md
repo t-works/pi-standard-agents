@@ -7,6 +7,13 @@ change to the runtime range is called out in the entry that makes it.
 
 ## [Unreleased]
 
+## [0.1.2]
+
+### Changed
+
+- The runtime range is `^0.2.5` (from `^0.2.4`). In 0.2.5 a model with no provider factory is a warning,
+  not an error, which is what lets a package name a model and leave the connection to the host.
+
 ## [0.1.1]
 
 A workflow can now be a directory package, so a run can follow an order that is code, and a caller with
@@ -32,8 +39,6 @@ no later turn can wait for it.
 
 ### Changed
 
-- The runtime range is `^0.2.5` (from `^0.2.4`). In 0.2.5 a model with no provider factory is a warning,
-  not an error, which is what lets a package name a model and leave the connection to the host.
 - A model defined in a package may omit its provider. `loadSource` now reports that as a **warning**
   rather than an error: the package names the model, the host supplies the connection, and
   `RuntimeOptions.hostProviders` (runtime 0.2.5) is the seam that makes it more than registry surgery.
