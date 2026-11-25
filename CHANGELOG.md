@@ -7,6 +7,19 @@ change to the runtime range is called out in the entry that makes it.
 
 ## [Unreleased]
 
+## [0.1.5]
+
+The provider warning no longer appears on runs where the host supplies the provider.
+
+### Fixed
+
+- A model the host can serve (the package ships a factory, `options.providers` has one by name, or PI's
+  registry knows the model id) no longer reports `Model 'x' has no provider factory`. The loader warns
+  before any host resolves, so on the escape path that warning was true at load and false by the first
+  turn — printed, journaled and returned by `wait` on every single run. Only that one warning is
+  filtered, and only when the answer is real: `piResolvesModel` asks PI's registry instead of assuming
+  it, so a model nobody can serve still says so before the turn dies.
+
 ## [0.1.4]
 
 `wait` now hands back what the run said, not only how it ended.

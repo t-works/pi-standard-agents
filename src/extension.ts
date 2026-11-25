@@ -43,7 +43,7 @@ import {
 } from "./events.ts";
 import type { JournalTotal } from "./journal.ts";
 import type { ModelCall } from "./models.ts";
-import { piModel, withUsage } from "./models.ts";
+import { piModel, piResolvesModel, withUsage } from "./models.ts";
 import type { ToolSpec, WorkflowSpec } from "./registry.ts";
 import { withBuiltinTools } from "./builtin-tools.ts";
 import type { OpenRun, RunPhase, RunStatus } from "./runs.ts";
@@ -540,6 +540,27 @@ export function createStandardAgentTool(
 		const runService = serviceFor(cwd);
 		let agent: string;
 		let open: OpenRun;
+		/** Assigned by whichever source ran; a model this host can answer for never warns. */
+		let canServe: (name: string) => boolean = () => false;
+
+		/**
+		 * True when this host can answer for a model: the package ships a factory, the
+		 * host was given one by name, or PI's registry exists to resolve one.
+		 *
+		 * The loader warns before any host resolves, so for these models the warning is
+		 * true at load time and false by the first turn — reporting it would teach a
+		 * reader to ignore warnings.
+		 */
+		const hostCanServe =
+			(models: ReadonlyMap<string, { model: string; provider?: unknown }>) =>
+			(name: string): boolean => {
+				const definition = models.get(name);
+				if (definition?.provider !== undefined) return true;
+				if (options.providers?.[name] !== undefined) return true;
+				// Ask the registry rather than assume it: a model PI does not know is exactly
+				// the case the warning exists for, and claiming otherwise hides the reason.
+				return ctx?.modelRegistry ? piResolvesModel({ modelRegistry: ctx.modelRegistry }, definition?.model ?? name) : false;
+			};
 
 		/**
 		 * The package's own factories, wrapped so their calls are measured.
@@ -607,6 +628,7 @@ export function createStandardAgentTool(
 			// JSON file can only name, and injecting them here would shadow a package
 			// that ships a `shell` of its own.
 			const models = measuredModels(loaded.registry.models);
+			canServe = hostCanServe(models);
 			open = await runService.createFromRegistry({ ...loaded.registry, models }, {
 				id,
 				dir: source.dir,
@@ -631,6 +653,7 @@ export function createStandardAgentTool(
 			// A workflow file is data, so it never carries a factory: every model here
 			// is one the host answers for.
 			const models = new Map(loaded.spec.models.map((model) => [model.name, model]));
+			canServe = hostCanServe(models);
 			open = await runService.create(loaded.spec, { cwd, hostProviders: hostProvidersFor(models) });
 		}
 
@@ -639,6 +662,12 @@ export function createStandardAgentTool(
 		// which model no factory answers for, and the run's own record keeps it.
 		const warnings = open.issues
 			.filter((issue) => issue.severity !== "error")
+			// Warnings are never filtered, only this one: a model the host answers for has a
+			// factory by the time the first turn runs, and saying otherwise is noise.
+			.filter((issue) => {
+				const providerPath = /^(.+)\.provider$/.exec(issue.path ?? "");
+				return providerPath === null || !canServe(providerPath[1] ?? "");
+			})
 			.map((issue) => `warning: ${issue.message}${issue.path ? ` (${issue.path})` : ""}`);
 		if (warnings.length > 0) {
 			open.journal.append({

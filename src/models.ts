@@ -196,6 +196,16 @@ function resolveModel(host: PiHost, id: string): PiModel<Api> {
 	);
 }
 
+/** Whether PI's registry knows a model id — the rule `resolveModel` applies, without the throw. */
+export function piResolvesModel(pi: PiHost, id: string): boolean {
+	try {
+		resolveModel(pi, id);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /** Standard Agents content parts → PI's text/image parts. */
 function toPiContent(content: ProviderMessageContent): string | (PiTextContent | PiImageContent)[] {
 	if (typeof content === "string") return content;

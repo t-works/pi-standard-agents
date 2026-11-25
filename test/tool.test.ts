@@ -557,6 +557,8 @@ test("wait: start blocks until the run ends and answers with the journal total",
 	assert.match(result.content[0]?.text ?? "", /idle: 16 tokens over 1 call\(s\)/);
 	// The words come with the ending: a caller that waits cannot ask later.
 	assert.equal((result.details as { answer?: string }).answer, "done");
+	// The host supplied this model, so the loader's warning is noise and is not reported.
+	assert.deepEqual((result.details as { warnings?: string[] }).warnings, []);
 	assert.ok(
 		result.content.some((part) => (part.text ?? "").startsWith("report:")),
 		"the answer travels with the ending",
