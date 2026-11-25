@@ -779,3 +779,85 @@ test("a package's own provider answers, is measured, and gets its credential fro
 	const messages = await readFile(join(threadDir(runDir, result.details.threadId), "messages.json"), "utf8");
 	assert.match(messages, /answered by the package's provider/, "the package's provider produced the answer");
 });
+
+test("a host-owned model with no factory anywhere fails by name, not at the first stack trace", async (t) => {
+	// The escape path's failure mode: the loader warns and the package loads, so the
+	// refusal has to come from the runtime, naming the model and both remedies.
+	const root = await mkdtemp(join(process.cwd(), ".tmp-orphan-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const pkg = await orphanPackage(root);
+
+	const h = await harness(t, root);
+	const result = await call<StartDetails>(h, { action: "start", workflow: pkg, task: "go", wait: true });
+	assert.equal(result.isError, undefined, result.content[0]?.text);
+	assert.equal(result.details.phase, "failed");
+	// The loader's warning is not dropped: the answer says which model nobody can
+	// supply, before a turn dies of it.
+	assert.match(
+		result.content.map((part) => part.text).join("\n"),
+		/warning: Model 'nobody' has no provider factory/,
+	);
+	const rows = await journalRows(runDirOf(root, result.details.runId));
+	assert.match(String(rows.find((row) => row.status === "warning")?.detail), /Model 'nobody' has no provider factory/);
+	// The refusal lands as a failed row, not a silent idle. No session subscribed
+	// here, so this row is the tool's own.
+	assert.equal(rows.filter((row) => row.status === "failed").length, 1, "one failed row");
+});
+
+test("a subscribed run journals one failed row, not the tool's and the runtime's", async (t) => {
+	const root = await mkdtemp(join(process.cwd(), ".tmp-subscribed-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const pkg = await orphanPackage(root);
+
+	const h = await harness(t, root);
+	// The production shape: the session's subscription is what journals a run's rows.
+	for (const handler of h.fakePi.handlersFor("session_start")) await handler.handler();
+	const result = await call<StartDetails>(h, { action: "start", workflow: pkg, task: "go", wait: true });
+	assert.equal(result.details.phase, "failed");
+	const failed = (await journalRows(runDirOf(root, result.details.runId))).filter(
+		(row) => row.status === "failed",
+	);
+	assert.equal(failed.length, 1, "one failed row, not two");
+	assert.equal(String(failed[0]?.detail), "step_error", "the runtime's own reason, from its status event");
+});
+
+/** A package whose only model is one the host never supplies: the 0.1.3 escape path. */
+async function orphanPackage(root: string): Promise<string> {
+	const pkg = join(root, "orphan");
+	for (const dir of ["agents", "prompts", "models"]) await mkdir(join(pkg, dir), { recursive: true });
+	await writeFile(
+		join(pkg, "agents", "assistant.ts"),
+		[
+			'import { defineAgent } from "@standardagents/spec";',
+			"",
+			"export default defineAgent({",
+			'\tname: "assistant",',
+			'\tsideA: { prompt: "assistant" },',
+			"\tsideB: { human: true },",
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	await writeFile(
+		join(pkg, "prompts", "assistant.ts"),
+		[
+			'import { definePrompt } from "@standardagents/spec";',
+			"",
+			"export default definePrompt({",
+			'\tname: "assistant",',
+			'\ttoolDescription: "Answer",',
+			'\tprompt: "Answer.",',
+			'\tmodel: "nobody",',
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	await writeFile(
+		join(pkg, "models", "nobody.ts"),
+		['// The host never supplies this one.', '\texport default { name: "nobody", model: "nobody-1" };', ""].join("\n"),
+		"utf8",
+	);
+	return pkg;
+}

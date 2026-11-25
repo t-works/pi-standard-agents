@@ -237,8 +237,8 @@ export interface OpenRun {
 	runtime: Runtime;
 	journal: Journal;
 	/**
-	 * Issues the registry build reported. Non-empty only when a run was reopened
-	 * from `spec.json` alone: the file cannot carry provider or tool code.
+	 * Issues the source reported: the loader's warnings for a package, the registry
+	 * build's for a reopened run. Errors never reach here — they refuse the run.
 	 */
 	issues: readonly DefinitionIssue[];
 	/** Threads `store.recoverStale()` settled while opening this run. */
@@ -256,6 +256,12 @@ export interface OpenRun {
 	 * Returns the unsubscribe; a listener that throws never ends a turn.
 	 */
 	listen(listener: (event: RuntimeEvent) => void): () => void;
+	/**
+	 * How many listeners this run has. A subscriber journals the run's ending from
+	 * the runtime's own event, so a caller that writes the same row itself asks
+	 * here first.
+	 */
+	listening(): number;
 }
 
 /** Options for {@link RunService}. Everything a host has to supply in code lives here. */
@@ -298,6 +304,15 @@ export interface CreateRunOptions {
 	cwd?: string;
 	/** Pick the run id yourself; the default is derived from the spec id. */
 	runId?: string;
+	/**
+	 * Supplies a provider factory for a model the spec only names, and is asked
+	 * before the registry's own `provider`.
+	 *
+	 * Per run, not per service, because the answer usually depends on the session
+	 * that started it — PI's model registry, a lab's scripted provider — and a run
+	 * pinned to a different answer is a different run, not a reconfiguration.
+	 */
+	hostProviders?: (name: string) => ProviderFactory | undefined;
 }
 
 /** Options for {@link RunService.createFromRegistry}: a package that is already built. */
@@ -310,6 +325,14 @@ export interface CreateFromRegistryOptions {
 	cwd?: string;
 	/** Pick the run id yourself; the default is derived from the package id. */
 	runId?: string;
+	/** See {@link CreateRunOptions.hostProviders}. */
+	hostProviders?: (name: string) => ProviderFactory | undefined;
+	/**
+	 * Warnings `loadSource` reported for this package. They are the run's record:
+	 * a model nobody can supply is a first-turn failure, and the user should read
+	 * it at `start`, not after a turn has died in the journal.
+	 */
+	issues?: readonly DefinitionIssue[];
 }
 
 /** Options for {@link RunService.open}. */
@@ -659,7 +682,15 @@ export class RunService {
 		};
 		writeSpecFile(runDir, file);
 
-		const open = this.materialize({ runDir, file, spec, registry, issues, tookOverLock: false });
+		const open = this.materialize({
+			runDir,
+			file,
+			spec,
+			registry,
+			issues,
+			tookOverLock: false,
+			...(options.hostProviders === undefined ? {} : { hostProviders: options.hostProviders }),
+		});
 		open.journal.append({
 			kind: "status",
 			at: new Date(this.clock()).toISOString(),
@@ -703,9 +734,16 @@ export class RunService {
 		};
 		writeSpecFile(runDir, file);
 
-		// The package was validated by `loadSource` before the first file was written,
-		// so there is no issue list to carry here: a bad package never gets a run dir.
-		const open = this.materialize({ runDir, file, spec, registry, issues: [], tookOverLock: false });
+		// A bad package never gets a run dir, so only warnings can arrive here.
+		const open = this.materialize({
+			runDir,
+			file,
+			spec,
+			registry,
+			issues: options.issues ?? [],
+			tookOverLock: false,
+			...(options.hostProviders === undefined ? {} : { hostProviders: options.hostProviders }),
+		});
 		open.journal.append({
 			kind: "status",
 			at: new Date(this.clock()).toISOString(),
@@ -793,6 +831,8 @@ export class RunService {
 		registry: Registry;
 		issues: readonly DefinitionIssue[];
 		tookOverLock: boolean;
+		/** Ask before a model's own factory; see {@link CreateRunOptions.hostProviders}. */
+		hostProviders?: (name: string) => ProviderFactory | undefined;
 	}): OpenRun {
 		const journal = openJournal(input.runDir, { fileName: JOURNAL_FILE });
 		const store = new ThreadStore(join(input.runDir, STORE_DIR), this.options.store ?? {});
@@ -802,6 +842,10 @@ export class RunService {
 		const runtime = new Runtime({
 			store,
 			registry: input.registry,
+			// The host names the connection for a model the package only names. A run
+			// reopened from `spec.json` has no host in hand, so it keeps the registry's
+			// own factories — which is why a source run refuses to reopen at all.
+			...(input.hostProviders === undefined ? {} : { hostProviders: input.hostProviders }),
 			onEvent: (event: RuntimeEvent) => {
 				counter.events += 1;
 				this.options.onEvent?.(event);
@@ -846,6 +890,7 @@ export class RunService {
 			tookOverLock: input.tookOverLock,
 			lock,
 			events: () => counter.events,
+			listening: () => listeners.size,
 			listen(listener) {
 				listeners.add(listener);
 				return () => {

@@ -28,7 +28,6 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 
 import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ProviderFactory } from "@standardagents/spec";
-import type { Registry } from "@t-works/standardagents-runtime/loader";
 import { formatIssues, hasErrors, loadSource, unqualify } from "@t-works/standardagents-runtime/loader";
 import type { Static } from "typebox";
 import { Type } from "typebox";
@@ -45,7 +44,7 @@ import {
 import type { JournalTotal } from "./journal.ts";
 import type { ModelCall } from "./models.ts";
 import { piModel, withUsage } from "./models.ts";
-import type { ModelSpec, ToolSpec, WorkflowSpec } from "./registry.ts";
+import type { ToolSpec, WorkflowSpec } from "./registry.ts";
 import { withBuiltinTools } from "./builtin-tools.ts";
 import type { OpenRun, RunPhase, RunStatus } from "./runs.ts";
 import { JOURNAL_FILE, RUNS_DIR, RunError, RunService, shutdownRunService } from "./runs.ts";
@@ -508,44 +507,6 @@ export function createStandardAgentTool(
 		return service;
 	}
 
-	/** The provider for one model: the spec's own, the host's, or PI's. */
-	function providerFor(model: ModelSpec, ctx: ToolContext): ProviderFactory | undefined {
-		if (model.provider) return model.provider;
-		const supplied = options.providers?.[model.name];
-		if (supplied) return supplied;
-		// Last resort: PI owns models and credentials, so a real workflow file with no
-		// injected factory still runs on the model the session resolved.
-		if (!ctx?.modelRegistry) return undefined;
-		return piModel({ modelRegistry: ctx.modelRegistry }, { name: model.name, model: model.model }).provider;
-	}
-
-	/**
-	 * The package's models, every provider wrapped so its usage lands in the journal.
-	 *
-	 * Same three sources as the JSON path: the package's own factory, one the host
-	 * supplied by name, then PI's registry. Wrapping is unconditional here because a
-	 * package's provider is code the run's record cannot see — the journal is the
-	 * only place its cost is written down.
-	 */
-	function modelsWithUsage(
-		registry: Registry,
-		ctx: ToolContext,
-		sinkSlot: () => ((call: ModelCall) => void) | null,
-	): Registry["models"] {
-		const models = new Map(registry.models);
-		for (const [name, definition] of models) {
-			const provider =
-				definition.provider ??
-				options.providers?.[name] ??
-				(ctx?.modelRegistry
-					? piModel({ modelRegistry: ctx.modelRegistry }, { name, model: definition.model }).provider
-					: undefined);
-			if (!provider) continue;
-			models.set(name, { ...definition, provider: withUsage(provider, (call) => sinkSlot()?.(call)) });
-		}
-		return models;
-	}
-
 	async function start(params: StandardAgentParams, ctx: ToolContext) {
 		const cwd = resolve(options.cwd ?? ctx?.cwd ?? process.cwd());
 		const source = resolveSource(required(params, "workflow"), cwd);
@@ -561,26 +522,57 @@ export function createStandardAgentTool(
 		let agent: string;
 		let open: OpenRun;
 
+		/**
+		 * The package's own factories, wrapped so their calls are measured.
+		 *
+		 * Resolution stays the runtime's business; this only attaches the journal sink,
+		 * because a provider the package owns is still a cost the run must report and
+		 * `spec.json` cannot carry the wrapper.
+		 */
+		const measuredModels = <D extends { provider?: ProviderFactory }>(models: ReadonlyMap<string, D>): Map<string, D> =>
+			new Map(
+				[...models].map(([name, definition]) => [
+					name,
+					definition.provider === undefined
+						? definition
+						: ({ ...definition, provider: withUsage(definition.provider, (call) => sinkSlot()?.(call)) } as D),
+				]),
+			);
+
+		/**
+		 * The host's answer for a model the source only names: a factory this host was
+		 * told about, then PI's registry. The call is measured on the way out, so even
+		 * a provider the host owns lands in the journal.
+		 *
+		 * The runtime asks this before the registry's own factory, so a host that maps
+		 * a name wins and a package that ships one keeps it when the host does not.
+		 */
+		const hostProvidersFor =
+			(models: ReadonlyMap<string, { model: string; provider?: unknown }>) =>
+			(name: string): ProviderFactory | undefined => {
+				const definition = models.get(name);
+				// The package's own factory wins: the runtime asks the host first, so a
+				// host that answered here would silently replace the provider the package
+				// shipped — and its credential slots with it.
+				if (definition?.provider !== undefined) return undefined;
+				const supplied = options.providers?.[name];
+				const factory =
+					supplied ??
+					(definition !== undefined && ctx?.modelRegistry
+						? piModel({ modelRegistry: ctx.modelRegistry }, { name, model: definition.model }).provider
+						: undefined);
+				return factory === undefined ? undefined : withUsage(factory, (call) => sinkSlot()?.(call));
+			};
+
 		if (source.kind === "directory") {
 			// A package is validated before a run directory exists, so a typo never
 			// leaves half a run behind for a later process to recover.
 			const loaded = await loadSource(source.dir);
-			// A portable package should not have to import a provider: the host owns
-			// models and keys. `loadSource` calls a model with no factory an error, so
-			// the host's providers are attached first and only the issues that survive
-			// that repair are reported — a model nobody can supply still fails, in the
-			// loader's own words.
-			const models = modelsWithUsage(loaded.registry, ctx, sinkSlot);
-			const supplied = new Set(
-				[...models]
-					.filter(([name, definition]) => definition.provider && !loaded.registry.models.get(name)?.provider)
-					.map(([name]) => name),
-			);
-			const issues = loaded.issues.filter(
-				(issue) => !(issue.path && supplied.has(issue.path.replace(/\.provider$/, ""))),
-			);
-			if (hasErrors(issues)) {
-				throw new ToolError("workflow_invalid", formatIssues(issues));
+			// A portable package need not import a provider: the host owns models and
+			// keys, and the runtime reports a model without one as a warning. Nothing to
+			// repair here — the host answers when the runtime asks.
+			if (hasErrors(loaded.issues)) {
+				throw new ToolError("workflow_invalid", formatIssues(loaded.issues));
 			}
 			agent = unqualify(String(params.agent ?? loaded.registry.agents.keys().next().value ?? ""));
 			if (!agent) {
@@ -595,7 +587,14 @@ export function createStandardAgentTool(
 			// The package's tools are its own: the built-ins implement declarations a
 			// JSON file can only name, and injecting them here would shadow a package
 			// that ships a `shell` of its own.
-			open = await runService.createFromRegistry({ ...loaded.registry, models }, { id, dir: source.dir, cwd });
+			const models = measuredModels(loaded.registry.models);
+			open = await runService.createFromRegistry({ ...loaded.registry, models }, {
+				id,
+				dir: source.dir,
+				cwd,
+				hostProviders: hostProvidersFor(models),
+				issues: loaded.issues,
+			});
 		} else {
 			// The built-ins are the implementation side of a workflow's tool declarations:
 			// a file can name `shell`, only code can run it.
@@ -610,18 +609,26 @@ export function createStandardAgentTool(
 					`Workflow '${loaded.spec.id}' has no agent '${params.agent ?? agent}'`,
 				);
 			}
-			const spec: WorkflowSpec = {
-				...loaded.spec,
-				models: loaded.spec.models.map((model) => {
-					const provider = providerFor(model, ctx);
-					if (!provider) return model;
-					return { ...model, provider: withUsage(provider, (call) => sinkSlot()?.(call)) };
-				}),
-			};
-			open = await runService.create(spec, { cwd });
+			// A workflow file is data, so it never carries a factory: every model here
+			// is one the host answers for.
+			const models = new Map(loaded.spec.models.map((model) => [model.name, model]));
+			open = await runService.create(loaded.spec, { cwd, hostProviders: hostProvidersFor(models) });
 		}
 
 		sink = open.journal.modelCallSink();
+		// A warning nobody reads is the failure at turn one instead: the loader says
+		// which model no factory answers for, and the run's own record keeps it.
+		const warnings = open.issues
+			.filter((issue) => issue.severity !== "error")
+			.map((issue) => `warning: ${issue.message}${issue.path ? ` (${issue.path})` : ""}`);
+		if (warnings.length > 0) {
+			open.journal.append({
+				kind: "status",
+				at: new Date().toISOString(),
+				status: "warning",
+				detail: warnings.join("; ").slice(0, 500),
+			});
+		}
 		// Before the first thread, before the first turn: a subscription attached
 		// later would miss the events that matter most (the run's opening lines).
 		options.onOpen?.(open);
@@ -703,9 +710,35 @@ export function createStandardAgentTool(
 			// `Runtime` (U04): a detached settle never waits for somebody else's work.
 			await open.runtime.settle();
 		})();
+		/** The runtime records why a thread failed on the thread; the journal is where a
+		 * later process looks, so the reason is copied across — one line, never a payload. */
+		const recordFailure = (reason: string): void => {
+			// A subscriber writes this row from the runtime's own status event. Writing it
+			// twice would say the same thing twice, so this is only the headless path.
+			if (open.listening() > 0) return;
+			open.journal.append({
+				kind: "status",
+				at: new Date().toISOString(),
+				status: "failed",
+				// Redacted here: an error's own words can carry anything the thread holds.
+				detail: thread.redact(reason).slice(0, 500),
+			});
+		};
+
 		settled.then(
-			() => wake(endedPhase(open.store.load(run.threadId))),
-			() => wake("failed"),
+			() => {
+				const record = open.store.load(run.threadId);
+				const phase = endedPhase(record);
+				if (phase === "failed") {
+					const reason = (record?.status as { reason?: string } | undefined)?.reason ?? "failed";
+					recordFailure(reason);
+				}
+				wake(phase);
+			},
+			(error: unknown) => {
+				recordFailure(String((error as { message?: string } | undefined)?.message ?? error));
+				wake("failed");
+			},
 		);
 
 		const deadlineMs = deadlineFrom(options);
@@ -746,15 +779,29 @@ export function createStandardAgentTool(
 						`${run.runId} ${run.agent} ${ended}: ` +
 							`${usage.totalTokens} tokens over ${usage.calls} call(s)${cost}`,
 					),
+					...warnings.map(text),
 				],
-				details: { runId: run.runId, revision: run.revision, threadId: run.threadId, phase: ended, usage },
+				details: {
+					runId: run.runId,
+					revision: run.revision,
+					threadId: run.threadId,
+					phase: ended,
+					usage,
+					warnings,
+				},
 			};
 		}
 
 		const phase: RunPhase = thread.data.status.state === "running" ? "running" : "idle";
 		return {
-			content: [text(`${run.runId} ${run.agent} ${phase}`)],
-			details: { runId: run.runId, revision: run.revision, threadId: run.threadId, phase },
+			content: [text(`${run.runId} ${run.agent} ${phase}`), ...warnings.map(text)],
+			details: {
+				runId: run.runId,
+				revision: run.revision,
+				threadId: run.threadId,
+				phase,
+				warnings,
+			},
 		};
 	}
 

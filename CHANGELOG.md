@@ -7,6 +7,39 @@ change to the runtime range is called out in the entry that makes it.
 
 ## [Unreleased]
 
+## [0.1.3]
+
+The host's provider is now supplied through the runtime's own seam instead of being pasted into a copy of
+the registry, and a run that fails says why in its journal.
+
+### Changed
+
+- `start` passes `hostProviders` to `RunService.create` / `createFromRegistry`. The runtime asks it before
+  a model's own factory, so the extension no longer rewrites the registry to fill a missing provider and
+  no longer filters the loader's issue list — with runtime 0.2.5 a providerless model is a warning, and
+  the refusal, when it comes, is the runtime's own error naming the model.
+- A package's own factory still wins: the resolver returns `undefined` for a model that already has one,
+  so a host mapping cannot silently replace a provider the package shipped — and its credential slots
+  with it. That factory is wrapped for the journal, which is measurement, not resolution.
+- `RunService.create*` gains `hostProviders`, per run rather than per service: the answer usually comes
+  from the session that started the run (PI's registry, a lab's script), and a run pinned to a different
+  answer is a different run. `createFromRegistry` also takes the loader's `issues`, so a package's
+  warnings belong to the run it opened.
+
+### Added
+
+- The loader's warnings reach the caller: a package whose model no factory answers for now says so in
+  `start`'s answer (and in `details.warnings`), and the run opens with one `status: warning` row. Before,
+  the loader's warning was filtered out of the loader's own issue list and surfaced as nothing at all —
+  the first turn died instead.
+
+### Fixed
+
+- A run whose turn failed wrote no failure row when nothing was subscribed to its events: `settle()`
+  resolves, the thread records `failed`/`step_error`, and the journal stayed silent. Such a run now gets
+  one `status` row from the tool, redacted and truncated, never a payload. A subscribed run keeps the row
+  its event mapping already writes, so a failure is journaled exactly once.
+
 ## [0.1.2]
 
 ### Changed

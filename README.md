@@ -149,10 +149,13 @@ package would rather not carry a vendor dependency at all, it names the model an
 export default { name: "fast", model: "deepseek/deepseek-flash" };
 ```
 
-The loader reports this as a **warning**, not an error, and the runtime resolves it from
-`RuntimeOptions.hostProviders` first, then the registry. If neither has a factory the run fails naming
-the model, not with a stack trace from the first turn. That is the escape path; the doctrine path
-above needs no host cooperation at all.
+The loader reports this as a **warning**, not an error, and `start` passes the warning on: the answer
+carries it and the run opens with a `warning` row in its journal. The runtime asks
+`RuntimeOptions.hostProviders` first and the registry second, and the extension passes a resolver built
+from its own `providers` option and PI's model registry. If neither has a factory the first turn fails
+with `Model 'x' has no provider factory and the host supplied none` (an error event), and the run is
+recorded as failed rather than silently idle. That is the escape path; the doctrine path above needs no
+host cooperation at all.
 
 Use the directory when the workflow is a process; use a JSON file when it is a conversation.
 
