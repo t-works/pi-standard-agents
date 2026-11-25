@@ -240,7 +240,7 @@ Two rules keep it honest:
 ## Dependency on the runtime
 
 `@t-works/standardagents-runtime` is a regular dependency, pinned to the range this repository tests
-(currently **`^0.2.4`**). It is not bundled: `dist/` holds our own compiled code only, and the
+(currently **`^0.2.5`**). It is not bundled: `dist/` holds our own compiled code only, and the
 runtime — with the `quickjs` engine it uses for sandboxed tool code — is loaded from `node_modules`.
 A runtime bump is a changelog entry in its own right, because narrowing or widening that range
 changes what a user installs underneath this extension.

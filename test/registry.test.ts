@@ -196,10 +196,11 @@ test("the shipped example builds once a provider is supplied for its models", as
 	assert.equal(registry.prompts.size, 3, "a shared prompt and one prompt per agent");
 	assert.equal(registry.prompts.get("triage")?.prompt instanceof Array, true);
 
-	// A model without a provider fails validation instead of on the first turn.
-	assert.throws(
-		() => buildRegistry(spec),
-		(error: unknown) =>
-			error instanceof RegistryBuildError && /has no provider factory/.test(error.message),
+	// A model without a provider is the host's to supply (runtime 0.2.5), so it is a
+	// warning that names it — the run fails naming the model, not on the first turn.
+	const unprovided = buildRegistry(spec);
+	assert.deepEqual(
+		unprovided.issues.map((issue) => [issue.severity, issue.path]),
+		[["warning", "fast.provider"]],
 	);
 });

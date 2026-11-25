@@ -32,6 +32,8 @@ no later turn can wait for it.
 
 ### Changed
 
+- The runtime range is `^0.2.5` (from `^0.2.4`). In 0.2.5 a model with no provider factory is a warning,
+  not an error, which is what lets a package name a model and leave the connection to the host.
 - A model defined in a package may omit its provider. `loadSource` now reports that as a **warning**
   rather than an error: the package names the model, the host supplies the connection, and
   `RuntimeOptions.hostProviders` (runtime 0.2.5) is the seam that makes it more than registry surgery.

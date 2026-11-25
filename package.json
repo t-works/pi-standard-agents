@@ -52,7 +52,7 @@
     "typebox": "*"
   },
   "dependencies": {
-    "@t-works/standardagents-runtime": "^0.2.4",
+    "@t-works/standardagents-runtime": "^0.2.5",
     "zod": "^4.0.0"
   },
   "devDependencies": {
