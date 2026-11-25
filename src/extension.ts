@@ -379,6 +379,25 @@ export async function listRuns(service: RunService, cwd: string): Promise<RunRep
 	return reports;
 }
 
+/** How much of a run's own words `wait` hands back: enough to judge it, not a transcript. */
+const REPORT_LIMIT = 4_000;
+
+/**
+ * The run's own answer, as the record holds it.
+ *
+ * A `wait`ed caller has no later turn in which to open `messages.json`, and a drain
+ * that reads only the phase cannot tell "answered" from "said nothing". The root
+ * thread's last assistant message is that answer for every side type — a prompt, a
+ * handler that ended the session with a result, or a tool-calling turn that
+ * finished on one.
+ */
+function reportOf(messages: readonly { role: string; content: string | null }[]): string {
+	const last = [...messages].reverse().find((message) => message.role === "assistant" && (message.content ?? "").trim() !== "");
+	const answer = (last?.content ?? "").trim();
+	if (answer === "") return "";
+	return answer.length > REPORT_LIMIT ? `…[trimmed, last ${REPORT_LIMIT} chars]\n${answer.slice(-REPORT_LIMIT)}` : answer;
+}
+
 /** Where a thread stands once the runtime has stopped running it. */
 function endedPhase(record: { terminated?: number | null; status?: { state: string } } | null): RunPhase {
 	if (!record) return "idle";
@@ -773,6 +792,9 @@ export function createStandardAgentTool(
 			const ended = await finished;
 			const usage = journalUsage(run.runDir);
 			const cost = usage.cost === null ? "" : ` $${usage.cost.toFixed(4)}`;
+			// The ending and the words together: a caller that asked to wait has no
+			// second turn in which to find out what the run actually said.
+			const answer = reportOf(open.store.loadMessages(run.threadId));
 			return {
 				content: [
 					text(
@@ -780,6 +802,8 @@ export function createStandardAgentTool(
 							`${usage.totalTokens} tokens over ${usage.calls} call(s)${cost}`,
 					),
 					...warnings.map(text),
+					...(answer === "" ? [] : [text(`report:
+${answer}`)]),
 				],
 				details: {
 					runId: run.runId,
@@ -788,6 +812,7 @@ export function createStandardAgentTool(
 					phase: ended,
 					usage,
 					warnings,
+					answer,
 				},
 			};
 		}

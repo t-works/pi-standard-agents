@@ -7,6 +7,18 @@ change to the runtime range is called out in the entry that makes it.
 
 ## [Unreleased]
 
+## [0.1.4]
+
+`wait` now hands back what the run said, not only how it ended.
+
+### Added
+
+- `start` with `wait: true` returns the run's own answer as a second content block (`report:` and the
+  root thread's last assistant message, tail-truncated at 4000 characters) and as `details.answer`. A
+  caller that asked to wait has no later turn in which to open `messages.json`, so a phase, a token
+  count and a cost left it unable to tell "answered" from "said nothing" — which is exactly how a run
+  that had answered read as silence.
+
 ## [0.1.3]
 
 The host's provider is now supplied through the runtime's own seam instead of being pasted into a copy of

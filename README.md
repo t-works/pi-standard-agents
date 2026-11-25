@@ -167,7 +167,13 @@ of the opening:
 
 ```
 main-1a2b3c4d planner idle: 4120 tokens over 6 call(s) $0.0042
+report:
+COMPLETE — run 2 changed src/plan.ts and test/plan.test.ts; acceptance line PASSed (tree 41a2f0c).
 ```
+
+The report is the root thread's last assistant message, tail-truncated at 4000 characters, and it is
+also `details.answer`. Without it a waiting caller can only see that the run ended, never what it said —
+which reads as silence when the run in fact answered.
 
 The wait resolves on the same ending the completion wake reports: a settle, `failed`/deadline, or a
 `stop`. Nothing outside the process can poll a run into completion, because the threads live in it —

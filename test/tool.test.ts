@@ -555,6 +555,12 @@ test("wait: start blocks until the run ends and answers with the journal total",
 	assert.equal(result.details.usage.totalTokens, TOKENS.totalTokens);
 	assert.equal(result.details.usage.calls, 1);
 	assert.match(result.content[0]?.text ?? "", /idle: 16 tokens over 1 call\(s\)/);
+	// The words come with the ending: a caller that waits cannot ask later.
+	assert.equal((result.details as { answer?: string }).answer, "done");
+	assert.ok(
+		result.content.some((part) => (part.text ?? "").startsWith("report:")),
+		"the answer travels with the ending",
+	);
 });
 
 test("a directory package runs its handler, pins its files, and cannot be reopened from spec.json", async (t) => {
