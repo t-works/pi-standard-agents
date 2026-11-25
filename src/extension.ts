@@ -24,11 +24,12 @@
  * constructor, no I/O) before any lock is taken or any file written.
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ProviderFactory } from "@standardagents/spec";
-import { unqualify } from "@t-works/standardagents-runtime/loader";
+import type { Registry } from "@t-works/standardagents-runtime/loader";
+import { formatIssues, hasErrors, loadSource, unqualify } from "@t-works/standardagents-runtime/loader";
 import type { Static } from "typebox";
 import { Type } from "typebox";
 
@@ -86,6 +87,7 @@ export type ToolErrorCode =
 	| "run_exists"
 	| "agent_unknown"
 	| "thread_terminated"
+	| "run_from_source"
 	| "internal_error";
 
 /** A refusal the tool reports as `isError`, never as a thrown error. */
@@ -192,6 +194,24 @@ function readWorkflowFile(path: string): WorkflowFileData {
 		);
 	}
 	return parsed as WorkflowFileData;
+}
+
+/** What `start` was pointed at: a workflow file, or a directory package. */
+type WorkflowSource = { kind: "file"; path: string } | { kind: "directory"; dir: string };
+
+/**
+ * A workflow may be a JSON file or a directory package.
+ *
+ * A directory in the conventional layout is the only form that can carry a
+ * handler, and a handler is the only place an order can be code — so this is the
+ * difference between running a team and running a conversation with a schema.
+ */
+function resolveSource(workflow: string, cwd: string): WorkflowSource {
+	const root = resolve(cwd);
+	for (const candidate of [resolve(root, workflow), join(root, EXAMPLES_DIR, workflow)]) {
+		if (existsSync(candidate) && statSync(candidate).isDirectory()) return { kind: "directory", dir: candidate };
+	}
+	return { kind: "file", path: resolveWorkflowPath(workflow, cwd) };
 }
 
 /**
@@ -394,6 +414,12 @@ interface DetachedRun {
 	timer: ReturnType<typeof setTimeout> | undefined;
 	/** True once the completion wake has been sent: exactly once per run. */
 	woken: boolean;
+	/**
+	 * Resolves the run's completion, for a caller that asked to wait. Idempotent:
+	 * the settle, the deadline and `stop` may all reach it, and only the first
+	 * phase survives.
+	 */
+	finish: (phase: RunPhase) => void;
 }
 
 function required(params: unknown, name: string): string {
@@ -439,7 +465,16 @@ const STANDARD_AGENT_PARAMETERS = Type.Object({
 		{ description: "What to do with the run." },
 	),
 	workflow: Type.Optional(
-		Type.String({ description: "Path to a workflow JSON file, or a name/id under examples/." }),
+		Type.String({
+			description:
+				"Path to a workflow JSON file, a directory package in the conventional layout (agents/, prompts/, …), or a name/id under examples/. A directory is the only form that can carry a handler, so the only form that runs an order rather than a conversation.",
+		}),
+	),
+	wait: Type.Optional(
+		Type.Boolean({
+			description:
+				"Block this turn until the run ends, then answer with its phase, tokens and cost. An unattended drain uses it; an interactive turn does not, because a turn that waits cannot be interrupted.",
+		}),
 	),
 	agent: Type.Optional(
 		Type.String({ description: "Agent to run. Defaults to the workflow's first agent." }),
@@ -484,22 +519,36 @@ export function createStandardAgentTool(
 		return piModel({ modelRegistry: ctx.modelRegistry }, { name: model.name, model: model.model }).provider;
 	}
 
+	/**
+	 * The package's models, every provider wrapped so its usage lands in the journal.
+	 *
+	 * Same three sources as the JSON path: the package's own factory, one the host
+	 * supplied by name, then PI's registry. Wrapping is unconditional here because a
+	 * package's provider is code the run's record cannot see — the journal is the
+	 * only place its cost is written down.
+	 */
+	function modelsWithUsage(
+		registry: Registry,
+		ctx: ToolContext,
+		sinkSlot: () => ((call: ModelCall) => void) | null,
+	): Registry["models"] {
+		const models = new Map(registry.models);
+		for (const [name, definition] of models) {
+			const provider =
+				definition.provider ??
+				options.providers?.[name] ??
+				(ctx?.modelRegistry
+					? piModel({ modelRegistry: ctx.modelRegistry }, { name, model: definition.model }).provider
+					: undefined);
+			if (!provider) continue;
+			models.set(name, { ...definition, provider: withUsage(provider, (call) => sinkSlot()?.(call)) });
+		}
+		return models;
+	}
+
 	async function start(params: StandardAgentParams, ctx: ToolContext) {
 		const cwd = resolve(options.cwd ?? ctx?.cwd ?? process.cwd());
-		const path = resolveWorkflowPath(required(params, "workflow"), cwd);
-		// The built-ins are the implementation side of a workflow's tool declarations:
-		// a file can name `shell`, only code can run it.
-		const loaded = loadWorkflow(path, { tools: withBuiltinTools(cwd, options.tools) });
-		const agent = unqualify(params.agent ?? loaded.spec.agents[0]?.name ?? "");
-		if (!agent) {
-			throw new ToolError("workflow_invalid", `'${path}' declares no agent and none was named`);
-		}
-		if (!loaded.spec.agents.some((declared) => unqualify(declared.name) === agent)) {
-			throw new ToolError(
-				"agent_unknown",
-				`Workflow '${loaded.spec.id}' has no agent '${params.agent ?? agent}'`,
-			);
-		}
+		const source = resolveSource(required(params, "workflow"), cwd);
 		const task = required(params, "task");
 
 		// The journal does not exist until the run does, and the runtime builds each
@@ -507,17 +556,71 @@ export function createStandardAgentTool(
 		// immediately afterwards. Every model call of this run, nested prompt tools
 		// included, then lands in one journal.
 		let sink: ((call: ModelCall) => void) | null = null;
-		const spec: WorkflowSpec = {
-			...loaded.spec,
-			models: loaded.spec.models.map((model) => {
-				const provider = providerFor(model, ctx);
-				if (!provider) return model;
-				return { ...model, provider: withUsage(provider, (call) => sink?.(call)) };
-			}),
-		};
-
+		const sinkSlot = () => sink;
 		const runService = serviceFor(cwd);
-		const open = await runService.create(spec, { cwd });
+		let agent: string;
+		let open: OpenRun;
+
+		if (source.kind === "directory") {
+			// A package is validated before a run directory exists, so a typo never
+			// leaves half a run behind for a later process to recover.
+			const loaded = await loadSource(source.dir);
+			// A portable package should not have to import a provider: the host owns
+			// models and keys. `loadSource` calls a model with no factory an error, so
+			// the host's providers are attached first and only the issues that survive
+			// that repair are reported — a model nobody can supply still fails, in the
+			// loader's own words.
+			const models = modelsWithUsage(loaded.registry, ctx, sinkSlot);
+			const supplied = new Set(
+				[...models]
+					.filter(([name, definition]) => definition.provider && !loaded.registry.models.get(name)?.provider)
+					.map(([name]) => name),
+			);
+			const issues = loaded.issues.filter(
+				(issue) => !(issue.path && supplied.has(issue.path.replace(/\.provider$/, ""))),
+			);
+			if (hasErrors(issues)) {
+				throw new ToolError("workflow_invalid", formatIssues(issues));
+			}
+			agent = unqualify(String(params.agent ?? loaded.registry.agents.keys().next().value ?? ""));
+			if (!agent) {
+				throw new ToolError("workflow_invalid", `'${source.dir}' declares no agent and none was named`);
+			}
+			if (!loaded.registry.agents.has(agent)) {
+				throw new ToolError("agent_unknown", `Package '${loaded.id}' has no agent '${params.agent ?? agent}'`);
+			}
+			// A local package has no manifest id to inherit, so the loader hands back its
+			// path: the basename is what names the run in a log line and in a run id.
+			const id = isAbsolute(loaded.id) ? basename(loaded.id) : loaded.id;
+			// The package's tools are its own: the built-ins implement declarations a
+			// JSON file can only name, and injecting them here would shadow a package
+			// that ships a `shell` of its own.
+			open = await runService.createFromRegistry({ ...loaded.registry, models }, { id, dir: source.dir, cwd });
+		} else {
+			// The built-ins are the implementation side of a workflow's tool declarations:
+			// a file can name `shell`, only code can run it.
+			const loaded = loadWorkflow(source.path, { tools: withBuiltinTools(cwd, options.tools) });
+			agent = unqualify(params.agent ?? loaded.spec.agents[0]?.name ?? "");
+			if (!agent) {
+				throw new ToolError("workflow_invalid", `'${source.path}' declares no agent and none was named`);
+			}
+			if (!loaded.spec.agents.some((declared) => unqualify(declared.name) === agent)) {
+				throw new ToolError(
+					"agent_unknown",
+					`Workflow '${loaded.spec.id}' has no agent '${params.agent ?? agent}'`,
+				);
+			}
+			const spec: WorkflowSpec = {
+				...loaded.spec,
+				models: loaded.spec.models.map((model) => {
+					const provider = providerFor(model, ctx);
+					if (!provider) return model;
+					return { ...model, provider: withUsage(provider, (call) => sinkSlot()?.(call)) };
+				}),
+			};
+			open = await runService.create(spec, { cwd });
+		}
+
 		sink = open.journal.modelCallSink();
 		// Before the first thread, before the first turn: a subscription attached
 		// later would miss the events that matter most (the run's opening lines).
@@ -525,6 +628,13 @@ export function createStandardAgentTool(
 
 		const thread = await open.runtime.createThread({ agentId: agent });
 		await thread.queueMessage({ role: "user", content: task }, { trigger: false });
+
+		// One resolver per run, so a `wait`ed turn learns the same ending the wake
+		// reports — and learns it even when `stop` ends the run instead.
+		let resolveFinished: (phase: RunPhase) => void = () => {};
+		const finished = new Promise<RunPhase>((resolvePhase) => {
+			resolveFinished = resolvePhase;
+		});
 
 		const run: DetachedRun = {
 			runId: open.runId,
@@ -534,11 +644,13 @@ export function createStandardAgentTool(
 			agent,
 			timer: undefined,
 			woken: false,
+			finish: (phase) => resolveFinished(phase),
 		};
 		runs.set(run.runId, run);
 
 		/** The single completion wake of this run. */
 		const wake = (phase: RunPhase): void => {
+			run.finish(phase);
 			if (run.woken) return;
 			run.woken = true;
 			if (run.timer !== undefined) {
@@ -619,6 +731,24 @@ export function createStandardAgentTool(
 					wake("failed");
 				})();
 			}, deadlineMs);
+		}
+
+		// The same four verbs, one of them optionally blocking. A drain is one
+		// process per run, and a process that answers and exits kills the run it
+		// started, so "wait" is the unattended form of `start`, not a convenience.
+		if (params.wait === true) {
+			const ended = await finished;
+			const usage = journalUsage(run.runDir);
+			const cost = usage.cost === null ? "" : ` $${usage.cost.toFixed(4)}`;
+			return {
+				content: [
+					text(
+						`${run.runId} ${run.agent} ${ended}: ` +
+							`${usage.totalTokens} tokens over ${usage.calls} call(s)${cost}`,
+					),
+				],
+				details: { runId: run.runId, revision: run.revision, threadId: run.threadId, phase: ended, usage },
+			};
 		}
 
 		const phase: RunPhase = thread.data.status.state === "running" ? "running" : "idle";
@@ -716,6 +846,8 @@ export function createStandardAgentTool(
 			clearTimeout(run.timer);
 			run.timer = undefined;
 		}
+		// A turn waiting on this run must not wait for a settle that will never come.
+		run?.finish("terminated");
 		return {
 			content: [
 				text(stopped.terminated.length ? `terminated ${stopped.terminated.join(", ")}` : "no live root thread"),

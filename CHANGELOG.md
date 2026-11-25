@@ -7,6 +7,36 @@ change to the runtime range is called out in the entry that makes it.
 
 ## [Unreleased]
 
+## [0.1.1]
+
+A workflow can now be a directory package, so a run can follow an order that is code, and a caller with
+no later turn can wait for it.
+
+### Added
+
+- `start` accepts a **directory package** in the conventional layout (`agents/`, `prompts/`, `models/`,
+  `tools/`, `hooks/`, `handlers/`, `effects/`), loaded with the runtime's `loadSource`. A JSON workflow
+  cannot carry a handler, so it cannot carry an order; a package can, and an agent side may be
+  `{ handler: "run_order" }`. The package's tools are its own — the built-ins only implement names a
+  JSON file can declare — and a package that references a tool it does not define is refused before the
+  run exists.
+- `spec.json` for such a run carries a `source` block: the directory, every definition file and its
+  hash. Editing a prompt, tool or handler is a new revision and therefore a new run. `RunService.open`
+  refuses these runs with `run_from_source`, because `spec.json` alone cannot rebuild the handler.
+- `start` takes `wait: true`: the call returns when the run ends instead of when it begins, with the
+  phase, tokens and cost the wake reports. A turn with no later chance to ask uses it; the default stays
+  detached, because a PI turn that waits cannot be interrupted.
+- `start` on a package wraps every provider it resolves in the journal sink, so a package that carries
+  its own provider factory still has its usage measured — asserted against a package-owned factory that
+  answers, reports its own tokens and takes its credential from a host-filled slot.
+
+### Changed
+
+- A model defined in a package may omit its provider. `loadSource` now reports that as a **warning**
+  rather than an error: the package names the model, the host supplies the connection, and
+  `RuntimeOptions.hostProviders` (runtime 0.2.5) is the seam that makes it more than registry surgery.
+  The doctrine path — a package that ships its provider — is unchanged and still wins.
+
 ## [0.1.0]
 
 A workflow can now do work, not only talk: the five tool names it may declare have implementations

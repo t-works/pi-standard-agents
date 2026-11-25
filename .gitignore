@@ -3,3 +3,6 @@ dist/
 *.tgz
 *.log
 .DS_Store
+
+# run store written by the extension itself when you try it in this repo
+.pi/standard-agents/

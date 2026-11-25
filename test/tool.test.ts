@@ -39,7 +39,7 @@ import extension, {
 	STANDARD_AGENT_TOOL_NAME,
 } from "../src/extension.ts";
 import type { ToolSpec } from "../src/registry.ts";
-import { JOURNAL_FILE, RECORD_FILE, RUNS_DIR, STORE_DIR } from "../src/runs.ts";
+import { JOURNAL_FILE, RECORD_FILE, RUNS_DIR, RunService, STORE_DIR } from "../src/runs.ts";
 import type { FakePi, RecordedMessage } from "./fake-pi.ts";
 import { createFakePi } from "./fake-pi.ts";
 import type { ScriptedReply } from "./scripted.ts";
@@ -524,4 +524,258 @@ test("a workflow that declares 'shell' runs it with no host tools supplied", asy
 		"utf8",
 	);
 	assert.match(messages, /exit: 0[\s\S]*built-in/, "the declared tool ran, and it was the built-in");
+});
+
+test("wait: start blocks until the run ends and answers with the journal total", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "std-agents-wait-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await writeWorkflow(root, "talks", {
+		id: "talks",
+		models: [{ name: "scripted", model: "scripted" }],
+		prompts: [
+			{ name: "main", toolDescription: "Answer the user", prompt: "Answer briefly.", model: "scripted" },
+		],
+		agents: [{ name: "main", sides: { a: { prompt: "main" }, b: { human: true } } }],
+	});
+	const h = await harness(t, root, {
+		providers: { scripted: scriptedProvider([{ content: "done", usage: TOKENS }]) },
+	});
+
+	const result = await call<StartDetails & { usage: { totalTokens: number; calls: number } }>(h, {
+		action: "start",
+		workflow: "talks",
+		task: "say done",
+		wait: true,
+	});
+
+	assert.equal(result.isError, undefined, result.content[0]?.text);
+	// The answer describes the ending, not the opening: an unattended caller has no
+	// later turn in which to ask.
+	assert.equal(result.details.phase, "idle");
+	assert.equal(result.details.usage.totalTokens, TOKENS.totalTokens);
+	assert.equal(result.details.usage.calls, 1);
+	assert.match(result.content[0]?.text ?? "", /idle: 16 tokens over 1 call\(s\)/);
+});
+
+test("a directory package runs its handler, pins its files, and cannot be reopened from spec.json", async (t) => {
+	// Inside the repository, so the fixture's `.ts` files resolve `@standardagents/spec`
+	// the same way a real package does.
+	const root = await mkdtemp(join(process.cwd(), ".tmp-directory-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const pkg = join(root, "order");
+	for (const dir of ["agents", "prompts", "models", "handlers"]) {
+		await mkdir(join(pkg, dir), { recursive: true });
+	}
+	await writeFile(
+		join(pkg, "agents", "order.ts"),
+		[
+			'import { defineAgent } from "@standardagents/spec";',
+			"",
+			"export default defineAgent({",
+			'\tname: "order",',
+			'\tdescription: "The order, as code.",',
+			'\tsideA: { label: "order", handler: "run_order" },',
+			'\tsideB: { human: true },',
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	await writeFile(
+		join(pkg, "handlers", "run_order.ts"),
+		[
+			'import { defineHandler } from "@standardagents/spec";',
+			"",
+			"export default defineHandler({",
+			'\tdescription: "Record a step and end the session.",',
+			"\texecute: async (state) => {",
+			'\t\tawait state.setValue("order.step", 1);',
+			'\t\tawait state.stopSession({ result: "handled by code" });',
+			"\t},",
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	await writeFile(
+		join(pkg, "prompts", "order.ts"),
+		[
+			'import { definePrompt } from "@standardagents/spec";',
+			"",
+			"export default definePrompt({",
+			'\tname: "order",',
+			'\ttoolDescription: "Never called: the order side is a handler.",',
+			'\tprompt: "Unused.",',
+			'\tmodel: "unused",',
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	await writeFile(
+		join(pkg, "models", "unused.ts"),
+		[
+			'import { defineModel } from "@standardagents/spec";',
+			"",
+			"export default defineModel({",
+			'\tname: "unused",',
+			'\tmodel: "unused-model",',
+			"\tprovider: () => ({",
+			'\t\tname: "unused",',
+			'\t\tspecificationVersion: "1",',
+			"\t\tasync generate() {",
+			'\t\t\tthrow new Error("the order handler makes no model call");',
+			"\t\t},",
+			"\t\tasync stream() {",
+			'\t\t\tthrow new Error("the order handler makes no model call");',
+			"\t\t},",
+			"\t}),",
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+
+	const h = await harness(t, root);
+	const first = await call<StartDetails>(h, { action: "start", workflow: pkg, task: "go", wait: true });
+	assert.equal(first.isError, undefined, first.content[0]?.text);
+	assert.equal(first.details.phase, "idle");
+
+	// The order ran as code: no model answered, and the session's result is the
+	// handler's own words.
+	const spec = JSON.parse(await readFile(join(runDirOf(root, first.details.runId), "spec.json"), "utf8")) as {
+		spec: { id: string; source: { kind: string; files: { path: string; sha: string }[] } };
+	};
+	assert.equal(spec.spec.id, "order", "a local package is named by its directory, not its path");
+	assert.equal(spec.spec.source.kind, "directory");
+	assert.ok(spec.spec.source.files.length >= 4, `every definition file is pinned: ${spec.spec.source.files.length}`);
+	for (const file of spec.spec.source.files) assert.match(file.sha, /^[0-9a-f]{12}$/);
+
+	// Same package, same revision, a different run: a revision is what the package
+	// *is*, not when it was started.
+	const second = await call<StartDetails>(h, { action: "start", workflow: pkg, task: "go again", wait: true });
+	assert.notEqual(second.details.runId, first.details.runId);
+	assert.equal(second.details.revision, first.details.revision);
+
+	// And the record cannot rebuild it: the handler is not in `spec.json`.
+	const service = new RunService({ cwd: root });
+	await assert.rejects(
+		() => service.open(runDirOf(root, first.details.runId)),
+		/reopen it by loading that directory/,
+	);
+	service.close();
+});
+
+test("a package's own provider answers, is measured, and gets its credential from the host", async (t) => {
+	// The doctrine path: the package binds its model to a provider it ships, and the
+	// consumer supplies the credential. No `providers` option: if the package's own
+	// factory did not run, this test could not pass.
+	const root = await mkdtemp(join(process.cwd(), ".tmp-vendor-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const pkg = join(root, "vendor");
+	for (const dir of ["agents", "prompts", "models"]) await mkdir(join(pkg, dir), { recursive: true });
+
+	await writeFile(
+		join(pkg, "agents", "assistant.ts"),
+		[
+			'import { defineAgent } from "@standardagents/spec";',
+			"",
+			"export default defineAgent({",
+			'\tname: "assistant",',
+			'\tdescription: "Answers with the package\'s own provider.",',
+			'\tsideA: { prompt: "assistant", label: "assistant" },',
+			"\tsideB: { human: true },",
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	await writeFile(
+		join(pkg, "prompts", "assistant.ts"),
+		[
+			'import { definePrompt } from "@standardagents/spec";',
+			"",
+			"export default definePrompt({",
+			'\tname: "assistant",',
+			'\ttoolDescription: "Answer once",',
+			'\tprompt: "Answer in one sentence.",',
+			'\tmodel: "vendor",',
+			"\tincludeChat: true,",
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	// The key never appears in this file: the factory declares a slot and the host
+	// fills it, which is what makes the package portable.
+	await writeFile(
+		join(pkg, "models", "vendor.ts"),
+		[
+			'import { defineModel } from "@standardagents/spec";',
+			"",
+			'const EXPECTED = "host-supplied-key";',
+			"",
+			"function provider(config) {",
+			"\treturn {",
+			'\t\tname: "vendor",',
+			'\t\tspecificationVersion: "1",',
+			"\t\tasync generate() {",
+			"\t\t\tif (config?.apiKey !== EXPECTED) {",
+			'\t\t\t\tthrow new Error("the host never supplied the credential slot");',
+			"\t\t\t}",
+			"\t\t\treturn {",
+			'\t\t\t\tcontent: "answered by the package\'s provider",',
+			"\t\t\t\treasoning: null,",
+			'\t\t\t\tfinishReason: "stop",',
+			"\t\t\t\tusage: { promptTokens: 31, completionTokens: 11, totalTokens: 42 },",
+			"\t\t\t};",
+			"\t\t},",
+			"\t\tasync stream() {",
+			'\t\t\tthrow new Error("not used");',
+			"\t\t},",
+			"\t};",
+			"}",
+			'provider.configSlots = { apiKey: { type: "secret", defaultEnv: "STAG_TEST_HOST_KEY" } };',
+			"",
+			"export default defineModel({",
+			'\tname: "vendor",',
+			'\tmodel: "vendor-1",',
+			"\tprovider,",
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+
+	process.env.STAG_TEST_HOST_KEY = "host-supplied-key";
+	t.after(() => {
+		delete process.env.STAG_TEST_HOST_KEY;
+	});
+
+	const h = await harness(t, root);
+	const result = await call<StartDetails & { usage: { totalTokens: number; calls: number } }>(h, {
+		action: "start",
+		workflow: pkg,
+		task: "go",
+		wait: true,
+	});
+	assert.equal(result.isError, undefined, result.content[0]?.text);
+	assert.equal(result.details.phase, "idle");
+	// The package's factory reported 42 tokens: `withUsage` wrapped it, so the journal
+	// measures a provider the package owns, not just one the host injected.
+	assert.equal(result.details.usage.totalTokens, 42);
+	assert.equal(result.details.usage.calls, 1);
+
+	const runDir = runDirOf(root, result.details.runId);
+	const rows = (await readFile(join(runDir, JOURNAL_FILE), "utf8"))
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line) as { kind: string; model?: string; usage?: { totalTokens: number } });
+	const call0 = rows.find((row) => row.kind === "model_call");
+	assert.ok(call0, "the call reached the journal");
+	assert.equal(call0?.model, "vendor-1");
+	assert.equal(call0?.usage?.totalTokens, 42);
+
+	const messages = await readFile(join(threadDir(runDir, result.details.threadId), "messages.json"), "utf8");
+	assert.match(messages, /answered by the package's provider/, "the package's provider produced the answer");
 });

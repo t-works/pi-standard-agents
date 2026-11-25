@@ -31,7 +31,7 @@ Requirements: Node **≥ 22.18**, and a PI version that accepts a default-factor
 
 | Surface | Name | What it does |
 | --- | --- | --- |
-| Tool | `standard_agent` | `start` / `status` / `message` / `stop` one run. `start` answers with a run id and a thread id in milliseconds. |
+| Tool | `standard_agent` | `start` / `status` / `message` / `stop` one run. `start` answers with a run id and a thread id in milliseconds, or blocks until the run ends when the caller passes `wait: true`. |
 | Command | `/sa` | `runs` (add `--follow` for live lines), `cost`, `stop <runId>`. Answers from disk, so it works when no run is live. |
 | Message | `standard-agent-run` | The completion wake: phase, revision, turns, tokens/cost and the last few live lines, folded by default. |
 | Tool | `std_smoke` | Returns a fixed string. Only there to prove the extension loaded and is reachable. |
@@ -109,6 +109,66 @@ Deadline: the runtime has no wall-clock cap of its own, so the host sets one. Le
 `PI_STANDARD_AGENTS_DEADLINE_MS` unset for an unattended run with no horizon, or set it (e.g.
 `PI_STANDARD_AGENTS_DEADLINE_MS=900000`) and a run that overruns is recorded as `failed`/`deadline`
 and terminated.
+
+## A workflow directory
+
+A JSON file can name agents and prompts, but it cannot carry code — so it cannot carry an **order**. A
+directory in the [conventional layout](https://github.com/standardagents) can:
+
+```
+factory/workflow/
+  agents/order.ts        side A is a handler, side B the operator
+  handlers/run_order.ts  the order itself: preflight, run, gate, advance, stop
+  prompts/*.ts  models/*.ts  tools/*.ts  hooks/*
+```
+
+`standard_agent start <dir>` loads it with the runtime's own `loadSource`, so handlers, tools and hooks
+run exactly as the package wrote them. An agent's side may therefore be `{ handler: "run_order" }`, and
+the run's order is code instead of a paragraph a model is asked to remember.
+
+What differs from the JSON form, and only this:
+
+- **The package's tools are its own.** The five built-ins implement declarations a JSON file can only
+  name; injecting them here would shadow a package that ships its own `shell`. Declare a tool the
+  package does not define and the run is refused before it starts.
+- **The pinned record names the files.** `spec.json` gets a `source` block with every definition file
+  and its hash, because code cannot be data. Editing any of them is a new revision, so it is a new run
+  — the same rule a JSON spec gets by content.
+- **Reopening means loading the directory.** `RunService.open` refuses a run that came from a package
+  (`run_from_source`): hydrating `spec.json` alone would rebuild a registry with no handler, and the
+  order would silently disappear.
+
+### A model the host owns
+
+The doctrine binds a model to the package: `models/vendor.ts` imports its provider, and the consumer
+supplies the credential through the slots that provider declares — never from the package. When a
+package would rather not carry a vendor dependency at all, it names the model and lets the host dial:
+
+```ts
+// models/fast.ts — no provider, no key, no vendor import
+export default { name: "fast", model: "deepseek/deepseek-flash" };
+```
+
+The loader reports this as a **warning**, not an error, and the runtime resolves it from
+`RuntimeOptions.hostProviders` first, then the registry. If neither has a factory the run fails naming
+the model, not with a stack trace from the first turn. That is the escape path; the doctrine path
+above needs no host cooperation at all.
+
+Use the directory when the workflow is a process; use a JSON file when it is a conversation.
+
+## Waiting for a run
+
+`start` is detached because a PI turn that waits cannot be interrupted. A caller with no later turn —
+a script, a scheduler, one `pi -p` process per drain — passes `wait: true` and gets the ending instead
+of the opening:
+
+```
+main-1a2b3c4d planner idle: 4120 tokens over 6 call(s) $0.0042
+```
+
+The wait resolves on the same ending the completion wake reports: a settle, `failed`/deadline, or a
+`stop`. Nothing outside the process can poll a run into completion, because the threads live in it —
+so this is the only shape in which an unattended drain keeps PI's model registry and the journal.
 
 ## Where runs live
 

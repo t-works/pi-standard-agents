@@ -91,7 +91,8 @@ export type RunErrorCode =
 	| "agent_unknown"
 	| "thread_not_found"
 	| "thread_terminated"
-	| "run_not_open";
+	| "run_not_open"
+	| "run_from_source";
 
 /** Thrown for every refusal that is a rule rather than a bug. */
 export class RunError extends Error {
@@ -111,11 +112,29 @@ export class RunError extends Error {
 }
 
 /**
+ * A directory package the run was built from, pinned by content.
+ *
+ * A package's definitions are code: `spec.json` cannot hold a prompt's `execute`
+ * or an agent's handler, so the record names the files and their hashes instead.
+ * Editing any of them changes the revision, which is what "a changed spec is a
+ * new run" has to mean when the spec is a directory.
+ */
+export interface RunSource {
+	kind: "directory";
+	/** Absolute path of the package, as it was loaded. */
+	dir: string;
+	/** Every definition file, with the hash that pins it. */
+	files: readonly { path: string; sha: string }[];
+}
+
+/**
  * The spec as a file can hold it: `provider` factories, hook and tool `execute`
  * functions are host code, not data, so they never reach `spec.json`.
  */
 export interface RunSpecData {
 	id: string;
+	/** Present only for a run opened from a directory package. */
+	source?: RunSource;
 	agents: readonly AgentSpec[];
 	prompts: readonly PromptSpec[];
 	/**
@@ -281,6 +300,18 @@ export interface CreateRunOptions {
 	runId?: string;
 }
 
+/** Options for {@link RunService.createFromRegistry}: a package that is already built. */
+export interface CreateFromRegistryOptions {
+	/** The workflow id the package was loaded as; it names the run and is pinned. */
+	id: string;
+	/** Absolute path of the directory the registry came from. */
+	dir: string;
+	/** Working directory the `.pi/standard-agents/runs` tree is created under. */
+	cwd?: string;
+	/** Pick the run id yourself; the default is derived from the package id. */
+	runId?: string;
+}
+
 /** Options for {@link RunService.open}. */
 export interface OpenRunOptions {
 	/**
@@ -302,6 +333,49 @@ export interface OpenRunOptions {
  */
 export function projectSpec(spec: WorkflowSpec): RunSpecData {
 	return JSON.parse(JSON.stringify(spec)) as RunSpecData;
+}
+
+/**
+ * A loaded directory package as spec-shaped data.
+ *
+ * `loadSource` hands back definitions, which are data plus code; projecting them
+ * through the same round trip `projectSpec` uses keeps `spec.json` and the
+ * revision talking about one object. Handlers are not in this data at all — a
+ * `WorkflowSpec` has no field for them — so the source file hashes are what pin
+ * the order: editing the handler is a new revision like editing a prompt.
+ */
+function specFromRegistry(registry: Registry, id: string): WorkflowSpec {
+	const named = (definitions: Map<string, object>): object[] =>
+		[...definitions].map(([name, definition]) => ({ name, ...definition }));
+	return {
+		id,
+		agents: named(registry.agents) as unknown as WorkflowSpec["agents"],
+		prompts: named(registry.prompts) as unknown as WorkflowSpec["prompts"],
+		models: [...registry.models.values()] as unknown as WorkflowSpec["models"],
+		tools: [...registry.tools].map(([name, definition]) => ({ ...definition, name })) as unknown as ToolSpec[],
+		hooks: [...registry.hooks.values()] as unknown as HookSpec[],
+	};
+}
+
+/**
+ * Every definition file the registry came from, with the hash that pins it.
+ *
+ * A file that cannot be read pins as `missing` rather than as a hash of nothing:
+ * the run record must not claim it read what it did not.
+ */
+function sourceFiles(registry: Registry): { path: string; sha: string }[] {
+	const files = new Map<string, string>();
+	for (const file of Object.values(registry.sources)) {
+		if (files.has(file)) continue;
+		let sha: string;
+		try {
+			sha = createHash("sha256").update(readFileSync(file)).digest("hex").slice(0, REVISION_LENGTH);
+		} catch {
+			sha = "missing";
+		}
+		files.set(file, sha);
+	}
+	return [...files].map(([path, sha]) => ({ path, sha })).sort((left, right) => (left.path < right.path ? -1 : 1));
 }
 
 /**
@@ -596,6 +670,52 @@ export class RunService {
 	}
 
 	/**
+	 * Open a run from a directory package that is already loaded.
+	 *
+	 * A package's order is a handler — code, not data — so no workflow file can
+	 * express it. That is why this exists beside `create`: same run directory, same
+	 * journal, same lock and the same `spec.json`, but the registry is the package's
+	 * own rather than one `buildRegistry` derived from JSON, and the pinned record
+	 * names the source files by hash instead of pretending their code is data.
+	 */
+	async createFromRegistry(registry: Registry, options: CreateFromRegistryOptions): Promise<OpenRun> {
+		const spec = specFromRegistry(registry, options.id);
+		const source: RunSource = { kind: "directory", dir: options.dir, files: sourceFiles(registry) };
+		const data: RunSpecData = { ...projectSpec(spec), source };
+		const revision = revisionOfData(data);
+
+		const cwd = resolve(options.cwd ?? this.options.cwd ?? process.cwd());
+		const runId = options.runId ?? runIdFor(data.id, this.clock());
+		const root = runsRoot(cwd);
+		mkdirSync(root, { recursive: true });
+		const runDir = join(root, runId);
+		if (existsSync(join(runDir, SPEC_FILE))) {
+			throw new RunError("run_exists", `Run '${runId}' already exists at '${runDir}'`, { runDir });
+		}
+		mkdirSync(runDir, { recursive: true });
+
+		const file: RunSpecFile = {
+			runId,
+			revision,
+			createdAt: new Date(this.clock()).toISOString(),
+			cwd,
+			spec: data,
+		};
+		writeSpecFile(runDir, file);
+
+		// The package was validated by `loadSource` before the first file was written,
+		// so there is no issue list to carry here: a bad package never gets a run dir.
+		const open = this.materialize({ runDir, file, spec, registry, issues: [], tookOverLock: false });
+		open.journal.append({
+			kind: "status",
+			at: new Date(this.clock()).toISOString(),
+			status: "created",
+			detail: `${data.id} at revision ${revision} (${source.files.length} file(s) from ${options.dir})`,
+		});
+		return open;
+	}
+
+	/**
 	 * Open an existing run directory.
 	 *
 	 * Order matters and is the whole single-writer rule:
@@ -609,6 +729,18 @@ export class RunService {
 	async open(runDir: string, options: OpenRunOptions = {}): Promise<OpenRun> {
 		const dir = resolve(runDir);
 		const file = readSpecFile(dir);
+
+		// A package's code is not in `spec.json`, so hydrating it from the file would
+		// build a registry with no handler — the order a run was started with would
+		// silently disappear. Reopening means loading the directory again.
+		if (file.spec.source) {
+			throw new RunError(
+				"run_from_source",
+				`Run '${file.runId}' was opened from the directory package '${file.spec.source.dir}': ` +
+					"reopen it by loading that directory, not from spec.json",
+				{ runDir: dir },
+			);
+		}
 
 		if (options.spec) {
 			const revision = revisionOf(options.spec);
